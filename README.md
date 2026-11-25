@@ -43,7 +43,7 @@ Alternatively, since full reproduction is time-consuming, you can skip Steps 1â€
 If you find our work useful in your research, please consider citing:
 
 	@article{tamajo2026understanding,
-  		title={Understanding Imbalanced Forgetting in Rehearsal-Based Class-Incremental Learning},
+  		title={Understanding Imbalanced Forgetting in Class-Incremental Learning with Class-Balanced Rehearsal},
   		author={Tamajo, Alberto and Dasmahapatra, Srinandan and Attar, Rahman},
   		journal={arXiv preprint arXiv:2605.14785},
   		year={2026}
