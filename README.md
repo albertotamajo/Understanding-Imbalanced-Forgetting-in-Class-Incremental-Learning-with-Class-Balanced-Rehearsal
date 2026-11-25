@@ -1,4 +1,4 @@
-# Understanding Imbalanced Forgetting in Rehearsal-Based Class-Incremental Learning
+# Understanding Imbalanced Forgetting in Class-Incremental Learning with Class-Balanced Rehearsal
 
 > Alberto Tamajo, Srinandan Dasmahapatra and Rahman Attar
 
