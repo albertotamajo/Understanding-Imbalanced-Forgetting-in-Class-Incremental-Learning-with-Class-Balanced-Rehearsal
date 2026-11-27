@@ -33,11 +33,10 @@ To fully reproduce the results presented in the paper, follow the instructions b
 1. We provide an `environment.yml` file containing a list of the necessary dependencies. Use it to reproduce the same environment in your machine.
 2. Run all the scripts inside the `Experiments` folder.
 3. Run all the scripts inside the `Extractions` folder.
-	- These scripts produce `.pkl` files containing the extracted data. Move these files into the corresponding subfolders inside the `Analysis` folder.
-4. Use the analysis scripts inside the subfolders in the `Analysis` folder to analyze the extracted data.
+	- These scripts produce `.pkl` files containing the extracted data. Move these files into the respective subfolders within the `Analysis` folder.
+4. Use the analysis scripts located in the subfolders of the `Analysis` folder to analyze the extracted data.
 ### Lightweight Reproducibility
-Alternatively, since full reproduction is time-consuming, you can skip Steps 1–3 by downloading from our Zenodo repository zipped folders containing the `.pkl` files generated during our empirical investigation. As before, move these files into the corresponding subfolders inside the `Analysis` folder and proceed to step 4.
-
+Alternatively, since full reproduction is time-consuming, you can skip Steps 1–3 by downloading the ZIP archives containing the .pkl files generated during our empirical investigation from our Zenodo repository. Extract the archives, move the files to their respective subfolders within the Analysis folder, and proceed directly to Step 4.
 
 ## Citation
 If you find our work useful in your research, please consider citing:
