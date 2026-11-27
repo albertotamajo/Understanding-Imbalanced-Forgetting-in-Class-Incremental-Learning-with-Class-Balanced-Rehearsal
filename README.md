@@ -14,7 +14,7 @@ Neural networks suffer from *catastrophic forgetting* in class-incremental learn
 ├── Analysis/          # Scripts for analyzing data extracted from completed experiments
 ├── Experiments/       # Scripts for running the experiments presented in the paper
 ├── Extractions/       # Scripts for extracting data from completed experiments
-├── benchmarks/        # CIFAR-100 and TinyImageNet benchmarks adapted to class-incremental learning
+├── benchmarks/        # CIFAR-100, TinyImageNet, and ImageNet benchmarks adapted to class-incremental learning
 ├── convnets/          # ResNet backbone implementations
 ├── metrics/           # Metrics tracked during continual learning
 ├── models/            # Building blocks for continual learning architectures
@@ -33,10 +33,10 @@ To fully reproduce the results presented in the paper, follow the instructions b
 1. We provide an `environment.yml` file containing a list of the necessary dependencies. Use it to reproduce the same environment in your machine.
 2. Run all the scripts inside the `Experiments` folder.
 3. Run all the scripts inside the `Extractions` folder.
-	- These scripts produce `.pkl` files containing the extracted data. Move these files into the `Analysis` folder.
-4. Use the `normal_exps_analysis` and `controlled_exps_analysis` scripts inside the `Analysis` folder to analyze the data extracted from the standard experiments and the controlled experiments, respectively.
+	- These scripts produce `.pkl` files containing the extracted data. Move these files into the corresponding subfolders inside the `Analysis` folder.
+4. Use the analysis scripts inside the subfolders in the `Analysis` folder to analyze the extracted data.
 ### Lightweight Reproducibility
-Alternatively, since full reproduction is time-consuming, you can skip Steps 1–3 by downloading from [here](https://1drv.ms/u/c/b2e831b9f4e18bc4/IQCz1LW5eOnKTKJ_9nycnNH_AWIRYC9Ro_Ac7cQPoPJlO2w?e=esjKdS) a zipped folder containing the `.pkl` files generated during our empirical investigation. As before, move these files into the `Analysis` folder and proceed to step 4.
+Alternatively, since full reproduction is time-consuming, you can skip Steps 1–3 by downloading from our Zenodo repository zipped folders containing the `.pkl` files generated during our empirical investigation. As before, move these files into the corresponding subfolders inside the `Analysis` folder and proceed to step 4.
 
 
 ## Citation
