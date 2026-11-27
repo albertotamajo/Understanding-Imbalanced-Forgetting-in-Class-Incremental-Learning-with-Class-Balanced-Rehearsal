@@ -5,15 +5,19 @@ This module includes a set of plugins
 from __future__ import annotations
 
 import itertools
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from abc import ABC
-from typing import Optional, Literal, Dict, Tuple, List, Iterable, Set, Union, Type, Callable, FrozenSet, TYPE_CHECKING
+from typing import (Optional, Literal, Dict, Tuple, List, Iterable, Set, Union, Type, Callable, FrozenSet, Any,
+                    TYPE_CHECKING)
+
+from llifc.utils import update_rows_by_id
 from training.storage_policy import (BufferDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
                                      ClassBalancedBufferDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate)
 from training.subset_generator import SubsetGeneratorGradientBasedReplayBufferSelection, RandomSubsetGenerator
 from metrics.gradient import (GradientLossWRTInputLastLayer, GradientLossWRTWeightsBiasesClassificationHead,
                               GradientCrossEntropyLossMSELossWRTWeightsBiasesClassificationHead)
 from metrics.forgetting import ForgettingEvents
+from metrics.logit_embeddings import LogitEmbeddingMetric
 from metrics.list_accumulator import ListAccumulator
 from utils import balance_dataset
 from benchmarks.datasets import SampleCacheMixin
@@ -23,6 +27,7 @@ from training.logits_storage import LogitsStorageDynamicNetworkInitFeatureExtrac
 from training.prob_vecs_storage import ProbVecsStorageDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate
 from training.loss_functions import CrossEntropyLossMSELossLogits
 import training.subset_generator as sg
+from models.network_class_incremental import NetworkClassIncremental
 
 from avalanche.core import SupervisedPlugin, Template, CallbackResult
 from avalanche.benchmarks.utils import concat_datasets
@@ -3267,23 +3272,1401 @@ class GradientSchedulerPluginDynamicNetworkInitFeatureExtractorIncrementalOutlie
             strategy.curr_sub_id = curr_sub_id  # re-store the state of the strategy's subnetwork id
 
 
+class LastLayerGradientInterventionsSchedulerPluginDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate(
+    DynamicNetworkInitFeatureExtractorIncrementalOutlierPlugin, supports_distributed=True):
+    """
+    Last-layer gradient interventions scheduler plugin
+    for :class:`DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate`.
+
+    This plugin schedules periodic interventions on the last-layer gradients at distinct optimisation points during the
+    SGD training path of certain training experiences. At a given optimisation point, the last-layer gradient is the
+    gradient w.r.t the weights and biases in the last layer. This plugin **assumes** that the underlying training loss
+    of the single subnetwork is the multi-class cross entropy loss. Prior to performing an actual update step at those
+    points in optimisation space scheduled to incur interventions,  this plugin retrieves the predicted raw logits,
+    corresponding embeddings (feature vectors), corresponding targets and corresponding indices of certain training
+    samples. From this collected information, it is possible to derive the gradient of the loss wrt the weights and bias
+    in the last layer for each of those samples. Interventions on the weights and biases in the last layer are performed
+    by registering a backward hook on each of them directly. This implies that these interventions only apply to the
+    last layer and do not backapropagate to earlier layers. The earlier layers are updated as if no interventions were
+    performed in the last layer.
+
+    .note::
+        This plugin *assumes* that the "dataset_indices" DataAttribute is present in the datasets of the **training**
+        experiences
+
+    .note::
+        This plugin *assumes* that the underlying model is an instance of :class:`NetworkClassIncremental`;
+        a :class:`RuntimeError` is raised otherwise.
+
+    .note::
+        This plugin *only* works when there is *only* one subnetwork
+
+    .note::
+        This plugin *assumes* that the underlying training loss of the single subnetwork is the multi-class cross
+        entropy loss. If `strategy._criterion` is not an instance
+        of :class:`nn.CrossEntropyLoss`, a :class:`RuntimeError` is raised.
+
+    .note::
+        This plugin *assumes* that the single subnetwork outputs raw logits rather than softmax probabilities.
+
+    .note::
+        This plugin *assumes* that training is performed on training experiences, i.e.,
+        `experience.origin_stream.name == "train"`; a :class:`RuntimeError` is raised otherwise.
+
+    .note::
+        The class targets used in this plugin are not the real class targets but the order in which
+        classes appear in the list of classes seen by the single subnetwork accessible through
+        `strategy.model.subnetworks_classes[id_of_the_single_subnetwork]
+    """
+    def __init__(self,
+                 intervention: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+                                         DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate],
+                                        Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Any]],
+                 frequency: int = 1,
+                 transform: Literal["train", "eval"] = "eval",
+                 excl_exps: Optional[Iterable[int]] = None,
+                 only_classes: Optional[Dict[int, Iterable[int]]] = None):
+        """
+        Create a new
+        LastLayerGradientInterventionsSchedulerPluginDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate
+        :param intervention: a callable that takes in five elements as input and outputs three elements. This is called
+            by the `before_backward` callback, within a torch.no_grad() block, each time an SGD iteration is scheduled
+            to incur an intervention in the last-layer gradient. The first input element is a tensor of predicted raw
+            logits; the second a tensor of corresponding embeddings (feature vectors); the third a tensor of
+            corresponding targets; the fourth a tensor of corresponding indices; and the fifth a reference to the
+            underlying strategy template. These tensors are collected prior to performing the actual update step at
+            that point in optimisation space; the samples which the tensor inputs are collected from depend on
+            `only_classes`. The first output element needs to be None or a tensor for the gradient wrt the weights in
+            the last layer to be used by the underlying optimizer to update the corresponding parameters at that step;
+            the second needs to be None or a tensor for the gradient wrt the bias in the last layer to be used by the
+            underlying optimizer to update the corresponding parameters at that step; the third needs to be any kind of
+            information that the user wants to store for that particular iteration. During the backward pass,
+            this plugin (1) replaces the original gradient wrt the weights in the last layer with the first output
+            element (if it is not None), and (2) replaces the original gradient wrt the bias in the last layer with the
+            second output element (if it is not None) by registering a backward hook on each of the corresponding
+            parameters. If the last output element is not None, it is appended into `self.data`, which is a list storing
+            desired information at each point in optimisation space scheduled to incur interventions; otherwise,
+            nothing is appended.
+        :param frequency: the frequency used to intervene on the last-layer gradients across iterations
+            of the SGD training path of each training experience. Values must be strictly positive (> 0); otherwise,
+            a :class:`ValueError` is raised. Default is 1.
+        :param transform: either `train` or `eval`. The type of transformations to apply to the training samples when
+            collecting the tensor inputs for the `intervention` callable. These transformations are the ones used by the
+            underlying benchmark. Usually, the `train` transformations perform sample-wise random modification,
+            such as random cropping, color jittering, etc., while the `eval` transformations do not apply modifications
+            to the samples. Note that this type of transformations is only applied to those training samples that are
+            not in the current training mini-batch (for those the type of transformation used depends on the type of
+            transformation used for training). Default is `eval`.
+        :param excl_exps: an iterable containing the IDs of the training experiences during which interventions on the
+            last-layer gradients must not be performed. If None, interventions on the last-layer gradients are
+            performed during each training experience. Default is None.
+        :param only_classes: a dictionary containing IDs of training experiences as keys and iterables of class targets
+            as values. The class targets **must not** be the real class targets but the order in which classes appear
+            in the list of classes seen by the single subnetwork accessible through
+            `strategy.model.subnetworks_classes[id_of_the_single_subnetwork]. During training on an experience
+            (during which interventions on the last-layer parameters are performed), if this is None or the ID of the
+            given experience is not a key in this dictionary, the tensor inputs for the `intervention` callable
+            are collected for **all** training samples of **all** the classes encountered so far (both the classes in
+            the current experience and the classes in the previously encountered experiences [if any]) (obviously this
+            also includes the training samples present in the current mini-batch). Otherwise, the
+            tensor inputs for the `intervention` callable are collected for **all** training samples of **only** the
+            class targets present in the iterable associated with the ID of the given training experience as well as
+            for the training samples present in the current mini-batch. If such an iterable is empty or contains targets
+            of classes not yet encountered, the tensor inputs for the `intervention` callable are collected for **only**
+            the training samples present in the current mini-batch. Default is None.
+        """
+        if frequency <= 0:
+            raise ValueError("frequency must be a strictly positive integer")
+        if transform not in ["train", "eval"]:
+            raise ValueError("transform must be equal to 'train' or 'eval'")
+
+        super().__init__()
+
+        self.intervention: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+                                     DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate],
+                                    Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Any]] = intervention
+        """
+        a callable that takes in five elements as input and outputs three elements. This is called
+        by the `before_backward` callback, within a torch.no_grad() block, each time an SGD iteration is scheduled to
+        incur an intervention in the last-layer gradient.
+        The first input element is a tensor of predicted raw logits; the second a tensor of corresponding embeddings
+        (feature vectors); the third a tensor of corresponding targets; the fourth a tensor of corresponding indices;
+        and the fifth a reference to the underlying strategy template. These tensors are collected prior to performing
+        the actual update step at that point in optimisation space; the samples which the tensor inputs are collected
+        from depend on `self.only_classes` The first output element needs to be None or a tensor for the gradient wrt
+        the weights in the last layer to be used by the underlying optimizer to update the corresponding parameters at
+        that step; the second needs to be None or a tensor for the gradient wrt the bias in the last layer to be used
+        by the underlying optimizer to update the corresponding parameters at that step; the third needs to be any kind
+        of information that the user wants to store for that particular iteration. During the backward pass,
+        this plugin (1) replaces the original gradient wrt the weights in the last layer with the first output element
+        (if it is not None), and (2) replaces the original gradient wrt the bias in the last layer with the second
+        output element (if it is not None) by registering a backward hook on each of the corresponding parameters.
+        If the last output element is not None, it is appended into `self.data`, which is a list storing
+        desired information at each point in optimisation space scheduled to incur interventions; otherwise,
+        nothing is appended.
+        """
+
+        self.frequency: int = frequency
+        """
+        the frequency used to intervene on the last-layer gradients across iterations of the SGD training path of each
+        training experience. Values must be strictly positive (> 0).
+        """
+
+        self.transform: Literal["train", "eval"] = transform
+        """
+        either `train` or `eval`. The type of transformations to apply to the training samples when
+        collecting the tensor inputs for the `self.intervention` callable. These transformations are the ones used by
+        the underlying benchmark. Usually, the `train` transformations perform sample-wise random modification,
+        such as random cropping, color jittering, etc., while the `eval` transformations do not apply modifications
+        to the samples. Note that this type of transformations is only applied to those training samples that are
+        not in the current training mini-batch (for those the type of transformation used depends on the type of
+        transformation used for training).
+        """
+
+        self.excl_exps: Set[int] = set() if excl_exps is None else set(excl_exps)
+        """
+        a set containing the IDs of the training experiences during which interventions on the last-layer gradients
+        must not be performed.
+        """
+
+        self.only_classes: Dict[int, Set[int]] = {} if only_classes is None else {k: set(v) for k, v in only_classes.items()}
+        """
+        a dictionary containing IDs of training experiences as keys and sets of class targets as values.
+        The class targets **must not** be the real class targets but the order in which classes appear
+        in the list of classes seen by the single subnetwork accessible through
+        `strategy.model.subnetworks_classes[id_of_the_single_subnetwork]. During training on an experience
+        (during which interventions on the last-layer parameters are performed), if the ID of the
+        given experience is not a key in this dictionary, the tensor inputs for the `self.intervention` callable
+        are collected for **all** training samples of **all** the classes encountered so far (both the classes in
+        the current experience and the classes in the previously encountered experiences [if any]) (obviously this
+        also includes the training samples present in the current mini-batch). Otherwise, the
+        tensor inputs for the `self.intervention` callable are collected for **all** training samples of **only** the
+        class targets present in the set associated with the ID of the given training experience as well as
+        for the training samples present in the current mini-batch. If such a set is empty or contains targets
+        of classes not yet encountered, the tensor inputs for the `self.intervention` callable are collected for
+        **only** the training samples present in the current mini-batch.
+        """
+
+        self.data: List[Any] = []
+        """
+        a list storing desired information at each point in optimisation space scheduled to incur interventions. At each
+        point in optimisation space (scheduled to incur interventions), this list is appended with the last element
+        output by `self.intervention` at that point, unless that element is None.  
+        """
+
+        self._handles: List = []
+        """
+        a list containing momentarily the handles returned when registering backward hooks on the weights and bias of
+        the last layer 
+        """
+
+        self._exps: List = []
+        """
+        a list of the training experiences encountered so far. The order of the experiences in this list reflects the
+        order with which these experiences were encountered.
+        """
+
+        self._interv_dataset: Optional[AvalancheDataset] = None
+        """
+        either None or an Avalanche dataset. Prior to performing training on the new training experience, if
+        interventions need to be performed during that experience, it is an Avalanche dataset containing the training
+        samples which the tensor inputs for the `self.intervention` callable need to be collected from during the
+        given experience. It is set to None after training on that experience. It is None in all other cases. 
+        """
+
+        self._logit_embeddings: LogitEmbeddingMetric = LogitEmbeddingMetric()
+        """
+        the standalone metric for keeping track of the predicted raw logits and embeddings (feature vectors)
+        """
+
+        self._eval_called: bool = False
+        """boolean flag indicating whether `strategy.eval` was called by this plugin"""
+
+    def before_training_exp(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
+                            **kwargs):
+        """
+        Callback called before training on the new experience.
+
+        This callback appends the new training experience to `self._exps` if it is a training experience
+        never encountered before. If interventions need to be performed during training on this new experience, this
+        callback builds the dataset containing the training samples which the tensor inputs for the `self.intervention`
+        callable need to be collected from and stores it in `self._interv_dataset`.
+        :param strategy: a strategy
+        :param kwargs: some keyword arguments
+        """
+        if strategy.experience.origin_stream.name != "train":  # if it is not a training experience
+            raise RuntimeError("Training must be performed only on training experiences.")
+
+        new_exp_id = strategy.experience.current_experience  # get the ID of the training experience
+        # if this experience has not been encountered before
+        if new_exp_id not in [exp.current_experience for exp in self._exps]:
+            self._exps.append(strategy.experience)  # append the new training experience
+
+        # if interventions need to be performed during training on this experience
+        if new_exp_id not in self.excl_exps:
+            # collect the training datasets associated with each experience encountered so far
+            train_datasets = [exp.dataset for exp in self._exps]
+            # if the tensor inputs for the self.intervention callable need to be collected only for certain past classes
+            # during training on this experience
+            if new_exp_id in self.only_classes.keys():
+                # get the class targets for which the tensor inputs for the self.intervention callable need to be
+                # collected during training on this experience
+                class_targets = self.only_classes[new_exp_id]
+                # get the classes seen by the single subnetwork
+                subnet_classes = next(iter(strategy.model.subnetworks_classes.values()))
+                def convert_target(x: int):
+                    if x not in subnet_classes:
+                        return -1
+                    return subnet_classes.index(x)
+                # for each training dataset encountered so far, retain only the training samples associated with class
+                # targets in `class_targets`
+                train_datasets = [d.subset([i for i, cls in enumerate(d.targets.data)
+                                            if convert_target(int(cls)) in class_targets])
+                                  for d in train_datasets]
+
+            # concatenate all training datasets
+            self._interv_dataset = concat_datasets(train_datasets)
+
+    def after_training_exp(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
+                            **kwargs):
+        """
+        Callback called after training on the new experience.
+
+        This callback sets `self._interv_dataset` to None.
+        :param strategy: a strategy
+        :param kwargs: some keyword arguments
+        """
+        self._interv_dataset = None
+
+    def after_train_datasets_adaptation(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
+                                        **kwargs):
+        """
+        Callback called after the train datasets adaptation.
+
+        This callback verifies that (1) `strategy.model` is an instance of :class:`NetworkClassIncremental`, (2)
+        there is a single subnetwork by checking that `strategy.adapted_dataset` contains
+        the dataset of a single subnetwork, and (3) `strategy._criterion` is an instance
+        of :class:`nn.CrossEntropyLoss`. If one of the three checks are negative, this callback raises
+        a :class`RuntimeError`.
+        :param strategy: a strategy
+        :param kwargs: some keyword arguments
+        """
+        if not isinstance(strategy.model, NetworkClassIncremental):
+            raise RuntimeError("The underlying model must be an instance of class `NetworkClassIncremental`")
+        if len(strategy.adapted_dataset) > 1:
+            raise RuntimeError("This plugin only works when there is a single subnetwork")
+        if not isinstance(strategy._criterion, nn.CrossEntropyLoss):
+            raise RuntimeError("The underlying training loss must be an instance of class `nn.CrossEntropyLoss`")
+
+    def after_eval_dataset_adaptation(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
+                                      **kwargs):
+        """
+        Callback called after the eval dataset adaptation.
+
+        This callback uses `self.transform` to set the type of transformations to apply to the training samples when
+        collecting the tensor inputs for the `self.intervention` callable.
+
+        This callback gets executed only if the current eval phase was called by this plugin.
+        This can be achieved by looking at the value of `self._eval_called`. This callback **should not** be executed
+        when the current eval phase was not called by this plugin.
+
+        :param strategy: a strategy
+        :param kwargs: some keyword arguments
+        """
+        if self._eval_called:
+            if self.transform == "train":
+                strategy.adapted_dataset = strategy.adapted_dataset.train()
+            else:
+                strategy.adapted_dataset = strategy.adapted_dataset.eval()
+
+    @torch.no_grad()
+    def before_backward(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
+                        **kwargs):
+        """
+        Callback called before each backward pass.
+
+        It gets executed according to the value of `self.excl_exps`, `self.frequency` and
+        `strategy.clock.train_exp_iterations`.
+
+        If executed, it captures the predicted raw logits, embeddings (feature vectors), targets and indices of
+        the samples in both `self._interv_dataset` and the current training mini-batch (if `self._interv_dataset` and
+        the current training mini-batch contain overlapping samples, the predicted logits and embeddings used for those
+        samples are those produced by the network during the forward pass that precedes this callback).
+        It then feeds these tensors into `self.intervention`, which in turn outputs the gradients to be used for
+        updating the weights and bias of the last layer at the current point in optimisation space, along with some
+        data to be appended into `self.data`. Finally, this callback register backward hooks on the weight and bias of
+        the last layer, unless the corresponding gradients output by `self.intervention` are None.
+
+        .note::
+            This callback is executed within a torch.no_grad() block.
+        """
+        counter = strategy.clock.train_exp_iterations
+        # if the ID of the current training experience is not in `self.excl_exps` and it is time for an intervention,
+        # then perform the intervention
+        if counter % self.frequency == 0 and strategy.experience.current_experience not in self.excl_exps:
+            # capture the predicted raw logits, embeddings (feature vectors), targets and indices of the samples
+            # in `self._interv_dataset`
+            logits, embeds, targets, indices = self._get_logit_embeddings(strategy, **kwargs)
+            # capture the predicted raw logits, embeddings (feature vectors), targets and indices of the samples in the
+            # current training mini-batch
+            mb_logits, mb_embeds, mb_targets, mb_indices = (strategy.mb_output_incremental_classifier,
+                                                            strategy.mb_feature_incremental_classifier,
+                                                            strategy.mb_y_incremental_classifier,
+                                                            strategy.mb_dataset_indices)
+            # since `logits`, `embeds`, `targets` and `indices` may be empty and thereby have wrong device and dtype,
+            # they are moved to the device and dtype of their mini-batch counterparts. If they are non-empty, this
+            # operation will not change their device and dtype as they match those of their mini-batch counterparts
+            logits, embeds, targets, indices = (logits.to(mb_logits),
+                                                embeds.to(mb_embeds),
+                                                targets.to(mb_targets),
+                                                indices.to(mb_indices))
+            # a mask for removing from `logits`, `embeds`, `targets`, `indices` data for the samples in the current
+            # training mini-batch
+            mb_mask = ~torch.isin(indices, mb_indices)
+            # remove from `logits`, `embeds`, `targets`, `indices` data for the samples in the current
+            # training mini-batch
+            logits, embeds, targets, indices = logits[mb_mask], embeds[mb_mask], targets[mb_mask], indices[mb_mask]
+            # concatenate to `logits`, `embeds`, `targets`, `indices` data for the samples in the current
+            # training mini-batch
+            logits, embeds, targets, indices = (torch.cat((logits, mb_logits), dim=0),
+                                                torch.cat((embeds, mb_embeds), dim=0),
+                                                torch.cat((targets, mb_targets), dim=0),
+                                                torch.cat((indices, mb_indices), dim=0))
+
+            grad_weights, grad_bias, data = self.intervention(logits, embeds, targets, indices, strategy)
+            if grad_weights is not None:
+                # retrieve the weights tensor from the last layer
+                weights: torch.Tensor = (strategy.model.subnetworks["0"].subnetworks["incremental_classifier"].classifier.
+                                         classifier.weight)
+                # register a hook on the weights tensor
+                self._handles.append(weights.register_hook(lambda grad: grad_weights))
+            if grad_bias is not None:
+                # retrieve the bias tensor from the last layer
+                bias: torch.Tensor = (strategy.model.subnetworks["0"].subnetworks["incremental_classifier"].classifier.
+                                      classifier.bias)
+                # register a hook on the bias tensor
+                self._handles.append(bias.register_hook(lambda grad: grad_bias))
+            if data is not None:
+                self.data.append(data)
+
+    def _get_logit_embeddings(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
+                              **kwargs) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Capture the predicted raw logits, embeddings (feature vectors), targets and indices of the samples in
+        `self._interv_dataset`.
+
+        If `self._interv_dataset` contains at least one training sample, this method calls `strategy.eval` on the first
+        experience in `self._exps` (replacing its dataset with `self._interv_dataset` and restoring the original one
+        once finished) to capture the above information. The `after_eval_iteration` callback is used as helper.
+
+        During the `strategy.eval` call performed by this callback, the metrics in `EvaluationPlugin` are not
+        computed as they would be meaningless and their computation would only be a computational overhead.
+
+        :param strategy: a strategy
+        :param kwargs: custom arguments
+        :return: a tuple containing the collected raw logits as first element,
+            the corresponding embeddings (feature vectors) as second element, the corresponding targets as third
+            element, and the corresponding indices as fourth element. If `self._interv_dataset` contains no training
+            samples, the raw logits, embeddings, targets and indices are just empty.
+        """
+        if self._interv_dataset is None:
+            raise RuntimeError("Raw logits, embeddings, targets and indices cannot be captured from the samples in "
+                               "`self._interv_dataset` because the latter is None")
+
+        # if `self._interv_dataset` contains at least one training sample
+        if len(self._interv_dataset) > 0:
+            if len(self._exps) == 0:
+                raise RuntimeError("`self._exps` must contain at least one training experience")
+            self._eval_called = True  # indicate that the next `strategy.eval` call is performed by this plugin
+            # get the evaluator
+            evaluator: EvaluationPlugin = [plg for plg in strategy.plugins if isinstance(plg, EvaluationPlugin)][0]
+            # this will deactivate the evaluator, i.e. metrics are not computed during the next eval call
+            evaluator.active = False
+
+            # get the first experience in `self._exps`
+            first_exp = self._exps[0]
+            # store the original dataset of the first experience
+            orig_dataset = first_exp.dataset
+            # replace the original dataset with `self._interv_dataset`
+            first_exp.dataset = self._interv_dataset
+            # start the eval phase for the given experience
+            strategy.eval(first_exp, **kwargs)
+            # restore the original dataset
+            first_exp.dataset = orig_dataset
+
+            # reset the flag to false
+            self._eval_called = False
+            # active the evaluator back again, so that metrics are computed when eval is not called by this plugin
+            evaluator.active = True
+
+        # get the collected raw logits, embeddings (feature vectors), targets and indices.
+        # They were collected by the `after_eval_iteration` callback during the `strategy.eval` call performed in the
+        # previous block of code. If the previous block of code was not performed, empty tensors are returned.
+        logits, embeds, targets, indices = self._logit_embeddings.result()
+        # reset to its initial state
+        self._logit_embeddings.reset()
+
+        return logits, embeds, targets, indices
+
+    def after_eval_iteration(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate, **kwargs):
+        """
+        Callback called after each eval iteration.
+
+        Capture the predicted raw logits, embeddings (feature vectors), targets and indices of the samples in
+        the current mini-batch. This callback gets executed only if the current eval phase was called by this plugin.
+        This can be achieved by looking at the value of `self._eval_called`. This callback **should not** be executed
+        when the current eval phase was not called by this plugin.
+        :param strategy: a strategy
+        :param kwargs: some keyword arguments
+        """
+        if self._eval_called:
+            curr_sub_id = strategy.curr_sub_id  # store the current state of the strategy's subnetwork id
+            subs_id = list(strategy.mb_output.keys())
+            if len(subs_id) > 1:
+                raise RuntimeError("This plugin must be used only when there is one subnetwork")
+            strategy.curr_sub_id = subs_id[0]
+            if "dataset_indices" not in strategy.use_in_getitem_indices.keys():
+                raise RuntimeError("The dataset of the current training experience must have the `dataset_indices` "
+                                   "DataAttribute")
+            indices = strategy.mb_dataset_indices
+            self._logit_embeddings.update(strategy.mb_output_incremental_classifier,
+                                          strategy.mb_y_incremental_classifier,
+                                          strategy.mb_feature_incremental_classifier,
+                                          indices=indices)
+            strategy.curr_sub_id = curr_sub_id  # re-store the state of the strategy's subnetwork id
+
+    def after_backward(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
+                       **kwargs):
+        """
+        Callback called after each backward pass.
+
+        It removes the hooks registered on the weights and bias of the last layer (if any) through the handles stored
+        in `self._handles`. It then empties `self._handles`.
+        """
+        for h in self._handles:
+            h.remove()
+        self._handles = []
+
+
+class FullGradientInterventionsSchedulerPluginDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate(
+    DynamicNetworkInitFeatureExtractorIncrementalOutlierPlugin, supports_distributed=True):
+    """
+    Full gradient interventions scheduler plugin
+    for :class:`DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate`.
+
+    This plugin schedules periodic interventions on the full gradients at distinct optimisation points
+    during the SGD training path of certain training experiences. At a given optimisation point, the full gradient is
+    the gradient w.r.t all the parameters in the underlying network. This plugin **assumes** that the underlying
+    training loss of the single subnetwork is the average multi-class cross entropy loss. Prior to performing an actual
+    update step at those points in optimisation space scheduled to incur interventions, this plugin retrieves the
+    average mini-batch full-gradient for each past class (if a past class has no samples in the current mini-batch its
+    average mini-batch full-gradient does not exist) and the average mini-batch full-gradient for the new-class samples.
+    Also, it retrieves the predicted raw logits, corresponding embeddings (feature vectors), corresponding targets and
+    corresponding indices of the samples in the current mini-batch. Optionally, for each past class in a set of past
+    classes, this plugin retrieves the average full-gradient computed over the entire training dataset of that class.
+    Optionally, for a set of classes (it can include both past and new classes), this plugin retrieves the predicted
+    raw logits, corresponding embeddings (feature vectors), corresponding targets and corresponding indices of all
+    training samples (for past classes, it also includes those training samples not currently stored in the rehearsal
+    set) belonging to one of those classes.
+
+    .note::
+        This plugin *assumes* that the "dataset_indices" DataAttribute is present in the datasets of the **training**
+        experiences
+
+    .note::
+        This plugin *assumes* that the underlying model is an instance of :class:`NetworkClassIncremental`;
+        a :class:`RuntimeError` is raised otherwise.
+
+    .note::
+        This plugin *only* works when there is *only* one subnetwork
+
+    .note::
+        The full-gradients are computed wrt *all* parameters in `strategy.model` except for those associated with the
+        outlier detector, which is just a dummy network in :class:`NetworkClassIncremental` instances
+
+    .note::
+        This plugin *assumes* that the underlying training loss of the single subnetwork is the multi-class cross
+        entropy loss with reduction set to `average` (the average value across the samples in the
+        current batch is computed). If `strategy._criterion` is not an instance
+        of :class:`nn.CrossEntropyLoss`, a :class:`RuntimeError` is raised.
+
+    .note::
+        This plugin *assumes* that the single subnetwork outputs raw logits rather than softmax probabilities.
+
+    .note::
+        This plugin *assumes* that training is performed on training experiences, i.e.,
+        `experience.origin_stream.name == "train"`; a :class:`RuntimeError` is raised otherwise.
+
+    .note::
+        This plugin *assumes* that no same class is present in distinct experiences.
+
+    .note::
+        This plugin *assumes* that no same training experience (with the same ID) is encoutenred more than once.
+        A :class:`RuntimeError` is raised otherwise.
+
+    .note::
+        The class targets used in this plugin are not the real class targets but the order in which
+        classes appear in the list of classes seen by the single subnetwork accessible through
+        `strategy.model.subnetworks_classes[id_of_the_single_subnetwork]
+    """
+    def __init__(self,
+                 intervention: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, List[str], torch.Tensor,
+                                         Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+                                         Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+                                         DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate],
+                                        Tuple[Optional[torch.Tensor], Any]],
+                 frequency: int = 1,
+                 mb_size: Optional[int] = None,
+                 transform: Literal["train", "eval"] = "eval",
+                 excl_exps: Optional[Iterable[int]] = None,
+                 only_past_classes_orig_full_grads: Optional[Dict[int, Iterable[int]]] = None,
+                 only_classes_logits_embeds: Optional[Dict[int, Iterable[int]]] = None):
+        """
+        Create a new
+        FullGradientInterventionsSchedulerPluginDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate
+        :param intervention: a callable that takes in eight elements as input and outputs two elements. This is called
+            by the `before_backward` callback, within a torch.no_grad() block, each time an SGD iteration is scheduled
+            to incur an intervention in the full-gradient. The first input element is a 2D tensor of shape
+            (n_past_classes+1 x grad_size), where `n_past_classes` is the number of past classes (classes encountered in
+            the past) and `grad_size` is the size of the average full-gradient. Each ith row, except for the last one,
+            contains the average mini-batch full-gradient for past class i (if no samples in the current mini-batch
+            belong to past class i, the average mini-batch full-gradient for past class i is set just to a vector of
+            NaNs). The last row contains the average mini-batch full-gradient for the new-class samples (if no samples
+            in the current mini-batch belong to new classes, the average mini-batch full-gradient for new-class samples
+            is set just to a vector of NaNs). During the first experience, the number of rows in this tensor is
+            obviously 1. The second input element is a 1D tensor of size `n_past_classes+1`, where `n_past_classes` is
+            the number of past classes (classes encountered in the past). Each ith element, except for the last one,
+            contains the number of samples belonging to past class i in the current mini-batch. The last element
+            contains the number of samples belonging to new classes in the current mini-batch.
+            The third input element is a 2D tensor of shape (`n_past_classes` x grad_size),
+            where `n_past_classes` is the number of past classes and `grad_size` is the size of the average
+            full-gradient. Each ith row contains the average full-gradient for past class i computed over its entire
+            training dataset or a vector of NaNs according to the value of `only_past_classes_orig_full_grads`. If past
+            class i has samples in the current mini-batch, then the average full-gradient for past class i over its
+            entire training dataset is computed using its current average mini-batch full-gradient and
+            its average full-gradient over all its training samples not currently in the mini-batch.
+            During the first experience, the number of rows in this tensor is obviously 0.
+            The fourth element is a list containing the names of the network parameters used to compute the
+            full-gradients; the order of the names matches the order used to compute the full-gradients. The fifth
+            element is a 1D tensor, of same length as the list of parameter names, containing at each ith index the
+            number of elements (weights) present in the respective parameter name.
+            The sixth element is a 4-tuple containing the following elements: 1) a tensor of predicted raw logits for
+            the samples in the current mini-batch, 2) a tensor of corresponding embeddings (feature vectors),
+            3) a tensor of corresponding targets, and 4) a tensor of corresponding indices. The seventh element is a
+            4-tuple containing the following elements: 1) a tensor of predicted raw logits, 2) a tensor of corresponding
+            embeddings (feature vectors), 3) a tensor of corresponding targets, and 4) a tensor of corresponding indices.
+            The samples which these tensors are computed for depends on the value of `only_classes_logits_embeds`. If
+            any of these samples is also present in the current mini-batch, then its collected information will match
+            that present in the previous input tuple.
+            If according to `only_classes_logits_embeds`, no samples need to have that information collected, the
+            tensors in this tuple will have the same number of dimensions as the respective ones in the previous input
+            tuple but have the size of the first dimension set to 0.  The eighth element is a reference to the
+            underlying strategy template.
+            The first output element needs to be None or a 1D tensor for the full-gradient to be used by the underlying
+            optimizer to update the network parameters at that step (the order of the parameters in this 1D tensor must
+            match the order used in the full-gradient input tensors); the second output element needs to be any kind of
+            information that the user wants to store for that particular iteration. After the backward pass,
+            this plugin replaces the original full-gradient with the first output element (if it is not None) by
+            modifying the `grad` attribute of each of the network parameters. If the last output element is not None,
+            it is appended into `self.data`, which is a list storing desired information at each point in optimisation
+            space scheduled to incur interventions; otherwise, nothing is appended.
+        :param frequency: the frequency used to intervene on the full-gradients across iterations
+            of the SGD training path of each training experience. Values must be strictly positive (> 0); otherwise,
+            a :class:`ValueError` is raised. Default is 1.
+        :param mb_size: mini-batch size used when computing the average full-gradient over the entire training dataset
+            of each past class for the third input element to the `intervention` callable. If None,
+            `strategy.eval_mb_size` is used. Default is None.
+        :param transform: either `train` or `eval`. The type of transformations to apply **only** to the training
+            samples not currently in the mini-batch when computing the third and seventh input elements for the
+            `intervention` callable. These transformations are the ones used by the underlying benchmark. Usually, the
+            `train` transformations perform sample-wise random modification, such as random cropping, color jittering,
+            etc., while the `eval` transformations do not apply modifications to the samples.
+            Note again that this type of transformation is only applied to those training samples that are
+            not in the current training mini-batch (for those the type of transformation used depends on the type of
+            transformation used for training). Default is `eval`.
+        :param excl_exps: an iterable containing the IDs of the training experiences during which interventions on the
+            full-gradients must not be performed. If None, interventions on the full-gradients are performed during
+            each training experience. Default is None.
+        :param only_past_classes_orig_full_grads: a dictionary containing IDs of training experiences as keys and
+            iterables of past class targets as values. The class targets **must not** be the real class targets but the
+            order in which classes appear in the list of classes seen by the single subnetwork accessible through
+            `strategy.model.subnetworks_classes[id_of_the_single_subnetwork]. During training on an experience
+            (during which interventions are performed), if this is None or the ID of the
+            given experience is not a key in this dictionary, the average full-gradient over the entire training dataset
+            is computed for each past class in the third input element for the `intervention` callable. Otherwise, the
+            average full-gradient over the entire training dataset in the third input element for the `intervention`
+            callable is computed for only the past class targets present in the iterable associated with the ID of the
+            given training experience. If such an iterable is empty or contains targets of classes that are not past
+            classes, no average full-gradient over the entire training dataset is actually computed. Default is None.
+        :param only_classes_logits_embeds: a dictionary containing IDs of training experiences as keys and
+            iterables of class targets as values. The class targets **must not** be the real class targets but the
+            order in which classes appear in the list of classes seen by the single subnetwork accessible through
+            `strategy.model.subnetworks_classes[id_of_the_single_subnetwork]. During training on an experience
+            (during which interventions are performed), if this is None or the ID of the
+            given experience is not a key in this dictionary, the information in the seventh input element to the
+            `intervention` callable is collected for **all** training samples encountered so far
+            (all the training samples of both past and new classes).
+            Otherwise, the information in the seventh input element is collected for only all training samples
+            belonging to classes whose target is present in the iterable associated with the ID of the given
+            training experience. If such an iterable is empty or contains targets of classes not yet encountered,
+            no information is collected in the seventh input element. Default is None.
+        """
+        if frequency <= 0:
+            raise ValueError("frequency must be a strictly positive integer")
+        if transform not in ["train", "eval"]:
+            raise ValueError("transform must be equal to 'train' or 'eval'")
+
+        super().__init__()
+
+        self.intervention: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, List[str], torch.Tensor,
+                                     Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+                                     Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+                                     DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate],
+                                    Tuple[Optional[torch.Tensor], Any]] = intervention
+        """
+        a callable that takes in eight elements as input and outputs two elements. This is called
+        by the `before_backward` callback, within a torch.no_grad() block, each time an SGD iteration is scheduled
+        to incur an intervention in the full-gradient. The first input element is a 2D tensor of shape
+        (n_past_classes+1 x grad_size), where `n_past_classes` is the number of past classes (classes encountered in
+        the past) and `grad_size` is the size of the average full-gradient. Each ith row, except for the last one,
+        contains the average mini-batch full-gradient for past class i (if no samples in the current mini-batch
+        belong to past class i, the average mini-batch full-gradient for past class i is set just to a vector of
+        NaNs). The last row contains the average mini-batch full-gradient for the new-class samples (if no samples
+        in the current mini-batch belong to new classes, the average mini-batch full-gradient for new-class samples
+        is set just to a vector of NaNs). During the first experience, the number of rows in this tensor is
+        obviously 1. The second input element is a 1D tensor of size `n_past_classes+1`, where `n_past_classes` is
+        the number of past classes (classes encountered in the past). Each ith element, except for the last one,
+        contains the number of samples belonging to past class i in the current mini-batch. The last element
+        contains the number of samples belonging to new classes in the current mini-batch.
+        The third input element is a 2D tensor of shape (`n_past_classes` x grad_size),
+        where `n_past_classes` is the number of past classes and `grad_size` is the size of the average
+        full-gradient. Each ith row contains the average full-gradient for past class i computed over its entire
+        training dataset or a vector of NaNs according to the value of `self.only_past_classes_orig_full_grads`.
+        If past class i has samples in the current mini-batch, then the average full-gradient for past class i over its
+        entire training dataset is computed using its current average mini-batch full-gradient and
+        its average full-gradient over all its training samples not currently in the mini-batch.
+        During the first experience, the number of rows in this tensor is obviously 0.
+        The fourth element is a list containing the names of the network parameters used to compute the
+        full-gradients; the order of the names matches the order used to compute the full-gradients. The fifth
+        element is a 1D tensor, of same length as the list of parameter names, containing at each ith index the
+        number of elements (weights) present in the respective parameter name.
+        The sixth element is a 4-tuple containing the following elements: 1) a tensor of predicted raw logits for
+        the samples in the current mini-batch, 2) a tensor of corresponding embeddings (feature vectors),
+        3) a tensor of corresponding targets, and 4) a tensor of corresponding indices. The seventh element is a
+        4-tuple containing the following elements: 1) a tensor of predicted raw logits, 2) a tensor of corresponding
+        embeddings (feature vectors), 3) a tensor of corresponding targets, and 4) a tensor of corresponding indices.
+        The samples which these tensors are computed for depends on the value of `self.only_classes_logits_embeds`. If
+        any of these samples is also present in the current mini-batch, then its collected information will match
+        that present in the previous input tuple.
+        If according to `self.only_classes_logits_embeds`, no samples need to have that information collected, the
+        tensors in this tuple will have the same number of dimensions as the respective ones in the previous input
+        tuple but have the size of the first dimension set to 0.  The eighth element is a reference to the
+        underlying strategy template.
+        The first output element needs to be None or a 1D tensor for the full-gradient to be used by the underlying
+        optimizer to update the network parameters at that step (the order of the parameters in this 1D tensor must
+        match the order used in the full-gradient input tensors); the second output element needs to be any kind of
+        information that the user wants to store for that particular iteration. After the backward pass,
+        this plugin replaces the original full-gradient with the first output element (if it is not None) by
+        modifying the `grad` attribute of each of the network parameters. If the last output element is not None,
+        it is appended into `self.data`, which is a list storing desired information at each point in optimisation
+        space scheduled to incur interventions; otherwise, nothing is appended.
+        """
+
+        self.frequency: int = frequency
+        """
+        the frequency used to intervene on the full-gradients across iterations of the SGD training path of each
+        training experience. Values must be strictly positive (> 0).
+        """
+
+        self.mb_size: Optional[int] = mb_size
+        """
+        mini-batch size used when computing the average full-gradient over the entire training dataset of each past
+        class for the third input element to the `self.intervention` callable. If None, `strategy.eval_mb_size` is used.
+        """
+
+        self.transform: Literal["train", "eval"] = transform
+        """
+        either `train` or `eval`. The type of transformations to apply **only** to the training
+        samples not currently in the mini-batch when computing the third and seventh input elements for the
+        `self.intervention` callable. These transformations are the ones used by the underlying benchmark. Usually, the
+        `train` transformations perform sample-wise random modification, such as random cropping, color jittering,
+        etc., while the `eval` transformations do not apply modifications to the samples.
+        Note again that this type of transformation is only applied to those training samples that are
+        not in the current training mini-batch (for those the type of transformation used depends on the type of
+        transformation used for training).
+        """
+
+        self.excl_exps: Set[int] = set() if excl_exps is None else set(excl_exps)
+        """
+        a set containing the IDs of the training experiences during which interventions on the full-gradients
+        must not be performed.
+        """
+
+        self.only_past_classes_orig_full_grads: Dict[int, Set[int]] = ({} if only_past_classes_orig_full_grads is None
+                                                                       else {k: set(v) for k, v in
+                                                                             only_past_classes_orig_full_grads.items()})
+        """
+        a dictionary containing IDs of training experiences as keys and sets of past class targets as values.
+        The class targets **must not** be the real class targets but the order in which classes appear in the list of
+        classes seen by the single subnetwork accessible through
+        `strategy.model.subnetworks_classes[id_of_the_single_subnetwork]`. During training on an experience
+        (during which interventions are performed), if the ID of the given experience is not a key in this dictionary,
+        the average full-gradient over the entire training dataset is computed for each past class in the third input
+        element for the `self.intervention` callable. Otherwise, the average full-gradient over the entire training
+        dataset in the third input element for the `self.intervention` callable is computed for only the past class
+        targets present in the set associated with the ID of the given training experience. If such a set is empty or
+        contains targets of classes that are not past classes, no average full-gradient over the entire training
+        dataset is actually computed.
+        """
+
+        self.only_classes_logits_embeds: Dict[int, Set[int]] = ({} if only_classes_logits_embeds is None
+                                                                else {k: set(v) for k, v in
+                                                                      only_classes_logits_embeds.items()})
+        """
+        a dictionary containing IDs of training experiences as keys and sets of class targets as values.
+        The class targets **must not** be the real class targets but the order in which classes appear in the list of
+        classes seen by the single subnetwork accessible through
+        `strategy.model.subnetworks_classes[id_of_the_single_subnetwork]`. During training on an experience
+        (during which interventions are performed), if the ID of the given experience is not a key in this dictionary,
+        the information in the seventh input element to the `self.intervention` callable is collected for **all**
+        training samples encountered so far (all the training samples of both past and new classes).
+        Otherwise, the information in the seventh input element is collected for only all training samples
+        belonging to classes whose target is present in the set associated with the ID of the given
+        training experience. If such a set is empty or contains targets of classes not yet encountered,
+        no information is collected in the seventh input element.
+        """
+
+        self.data: List[Any] = []
+        """
+        a list storing desired information at each point in optimisation space scheduled to incur interventions. At each
+        point in optimisation space (scheduled to incur interventions), this list is appended with the last element
+        output by `self.intervention` at that point, unless that element is None.  
+        """
+
+        self._exps: OrderedDict[FrozenSet[int], CLExperience] = OrderedDict()
+        """
+        an ordered dictionary containing the training experiences encountered so far as values.
+        The respective key of each experience is a set (frozenset because it is hashable) containing the target labels
+        in the training dataset of that experience. The target labels are those output by the underlying CL benchmark
+        """
+
+        self._logits_embeds_dataset: Optional[AvalancheDataset] = None
+        """
+        either None or an Avalanche dataset. Prior to performing training on the new training experience, if
+        interventions need to be performed during that experience, it is an Avalanche dataset containing the training
+        samples which information in the seventh input element to the `self.intervention` callable needs to be collected
+        for during the given experience. It is set to None after training on that experience.
+        It is None in all other cases. 
+        """
+
+        self._logit_embeddings: LogitEmbeddingMetric = LogitEmbeddingMetric()
+        """
+        the standalone metric for keeping track of the predicted raw logits and embeddings (feature vectors)
+        """
+
+        self._average_full_gradient: Optional[Tuple[torch.Tensor, int]] = None
+        """
+        always None except when `strategy.eval_with_grad` is called by `self._get_average_full_gradients`.
+        When not None, it is a 2-tuple where the first element is a 1D tensor of the average full-gradient computed so
+        far and the second element is the number of samples used for computing the average so far.
+        """
+
+        self._curr_avg_full_grad: Optional[torch.Tensor] = None
+        """
+        always None except when the `before_backward` callback is executed. When the latter is executed, it stores the
+        first output element of `self.intervention`, which could be either None or a tensor. In case it is not None, it
+        is used by the `after_backward` callback to perform the actual full-gradient interventions. The `after_backward`
+        callback sets it back to None.
+        """
+
+        self._eval_called: Literal["no", "logit_embeddings", "full_gradients"] = "no"
+        """ 
+        literal indicating whether the current evaluation process was called by  `self._get_logit_embeddings`,
+        `self._get_average_full_gradients` or neither of them
+        """
+
+    def before_training_exp(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
+                            **kwargs):
+        """
+        Callback called before training on the new experience.
+
+        This callback adds the new training experience, along with its set of target labels, to `self._exps` if it is a
+        training experience never encountered before.
+        If interventions need to be performed during training on this new experience, this
+        callback builds the dataset containing the training samples which information in the seventh input element to
+        the `self.intervention` callable needs to be collected for and stores it in `self._logits_embeds_dataset`.
+        :param strategy: a strategy
+        :param kwargs: some keyword arguments
+        """
+        if strategy.experience.origin_stream.name != "train":  # if it is not a training experience
+            raise RuntimeError("Training must be performed only on training experiences.")
+
+        new_exp_id = strategy.experience.current_experience  # get the ID of the training experience
+        # if this experience has been encountered before
+        if new_exp_id in [exp.current_experience for exp in self._exps.values()]:
+            raise RuntimeError("This training experience was encountered before.")
+
+        # get the dataset associated with the new training experience
+        new_exp_dataset = strategy.experience.dataset
+        if len(new_exp_dataset) == 0:
+            raise RuntimeError("The dataset associated with the new training experience is empty")
+        if not hasattr(new_exp_dataset, "dataset_indices"):
+            raise RuntimeError("The dataset associated with the new training experience does not contain the "
+                               "`dataset_indices` DataAttribute")
+
+        key = frozenset(strategy.experience.dataset.targets)
+        # add the new training experience along with its set of target labels
+        self._exps[key] = strategy.experience
+
+        # if interventions need to be performed during training on this experience
+        if new_exp_id not in self.excl_exps:
+            # collect the training datasets associated with each experience encountered so far
+            train_datasets = [exp.dataset for exp in self._exps.values()]
+            # if information in the seventh input element to the `self.intervention` callable needs to be collected only
+            # for certain classes during training on this experience
+            if new_exp_id in self.only_classes_logits_embeds.keys():
+                # get the class targets for which information in the seventh input element to the `self.intervention`
+                # callable needs to be collected for during training on this experience
+                class_targets = self.only_classes_logits_embeds[new_exp_id]
+                # get the classes seen by the single subnetwork
+                subnet_classes = next(iter(strategy.model.subnetworks_classes.values()))
+                def convert_target(x: int):
+                    if x not in subnet_classes:
+                        return -1
+                    return subnet_classes.index(x)
+                # for each training dataset encountered so far, retain only the training samples associated with class
+                # targets in `class_targets`
+                train_datasets = [d.subset([i for i, cls in enumerate(d.targets.data)
+                                            if convert_target(int(cls)) in class_targets])
+                                  for d in train_datasets]
+
+            # concatenate all training datasets
+            self._logits_embeds_dataset = concat_datasets(train_datasets)
+
+    def after_training_exp(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
+                            **kwargs):
+        """
+        Callback called after training on the new experience.
+
+        This callback sets `self._logits_embeds_dataset` to None.
+        :param strategy: a strategy
+        :param kwargs: some keyword arguments
+        """
+        self._logits_embeds_dataset = None
+
+    def after_train_datasets_adaptation(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
+                                        **kwargs):
+        """
+        Callback called after the train datasets adaptation.
+
+        This callback verifies that (1) `strategy.model` is an instance of :class:`NetworkClassIncremental`, (2)
+        there is a single subnetwork by checking that `strategy.adapted_dataset` contains
+        the dataset of a single subnetwork, and (3) `strategy._criterion` is an instance
+        of :class:`nn.CrossEntropyLoss`. If one of the three checks are negative, this callback raises
+        a :class`RuntimeError`.
+        :param strategy: a strategy
+        :param kwargs: some keyword arguments
+        """
+        if not isinstance(strategy.model, NetworkClassIncremental):
+            raise RuntimeError("The underlying model must be an instance of class `NetworkClassIncremental`")
+        if len(strategy.adapted_dataset) > 1:
+            raise RuntimeError("This plugin only works when there is a single subnetwork")
+        if not isinstance(strategy._criterion, nn.CrossEntropyLoss):
+            raise RuntimeError("The underlying training loss must be an instance of class `nn.CrossEntropyLoss`")
+
+    def after_eval_dataset_adaptation(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
+                                      **kwargs):
+        """
+        Callback called after the eval dataset adaptation.
+
+        This callback uses `self.transform` to set the type of transformations to apply to the training samples
+        when collecting information for either the third or the seventh input elements for the `self.intervention`
+        callable.
+
+        This callback gets executed only if the current eval phase was called by this plugin.
+        This can be achieved by looking at the value of `self._eval_called`. This callback **should not** be executed
+        when the current eval phase was not called by this plugin.
+
+        :param strategy: a strategy
+        :param kwargs: some keyword arguments
+        """
+        if self._eval_called in ["logit_embeddings", "full_gradients"]:
+            if self.transform == "train":
+                strategy.adapted_dataset = strategy.adapted_dataset.train()
+            else:
+                strategy.adapted_dataset = strategy.adapted_dataset.eval()
+
+    def before_backward(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
+                        **kwargs):
+        """
+        Callback called before each backward pass.
+
+        It gets executed according to the value of `self.excl_exps`, `self.frequency` and
+        `strategy.clock.train_exp_iterations`.
+
+        If executed, it first captures the inputs for the `self.intervention` callable. It then feeds them into the
+        callable, which in turn outputs the full-gradient to be used for updating the network parameters at the current
+        point in optimisation space, along with some data to be appended into `self.data`. This callback stores the
+        output full-gradient into `self._curr_avg_full_grad`.
+        """
+        counter = strategy.clock.train_exp_iterations
+        # if the ID of the current training experience is not in `self.excl_exps` and it is time for an intervention,
+        # then perform the intervention
+        if counter % self.frequency == 0 and strategy.experience.current_experience not in self.excl_exps:
+            # get the first input element to the `self.intervention` callable
+            avg_mini_batch_full_grads = self._get_average_mini_batch_full_gradients(strategy, **kwargs)
+            # get the total number of classes seen so far
+            n_classes = strategy.mb_output_incremental_classifier.shape[1]
+            # get the number of old classes by subtracting to the total number the number of classes in the current
+            # experience
+            n_old_classes = n_classes - len(strategy.experience.classes_in_this_experience)
+            # get the number of samples belonging to each class in the current mini-batch
+            n_mb_samples = torch.bincount(strategy.mb_y_incremental_classifier, minlength=n_classes)
+            # get the second input element to the `self.intervention` callable
+            n_mb_samples = torch.cat((n_mb_samples[:n_old_classes],
+                                      n_mb_samples[n_old_classes:].sum(dim=0, keepdim=True)), dim=0)
+            # get the third input element to the `self.intervention` callable
+            avg_full_grads = self._get_average_full_gradients(strategy, avg_mini_batch_full_grads[:-1],
+                                                              n_mb_samples[:-1], **kwargs)
+            # get all the parameter names and corresponding tensors in the underlying model, except for those associated
+            # with the outlier detector
+            named_params = self._named_parameters_stable(strategy.model)
+            # get the fourth input element to the `self.intervention` callable
+            names = [n for n, p in named_params]
+            # get the fifth input element to the `self.intervention` callable
+            parameter_sizes = torch.tensor([p.numel() for n, p in named_params],
+                                           device=avg_mini_batch_full_grads.device, dtype=torch.int64)
+            # get the sixth input element to the `self.intervention` callable
+            mini_batch_logit_embeddings = self._get_mini_batch_logit_embeddings(strategy, **kwargs)
+            # get the seventh input element to the `self.intervention` callable
+            logit_embeddings = self._get_logit_embeddings(strategy, **kwargs)
+
+            # call `self.intervention` inside a no_grad block
+            with torch.no_grad():
+                curr_avg_full_grad, data = self.intervention(avg_mini_batch_full_grads,
+                                                             n_mb_samples,
+                                                             avg_full_grads,
+                                                             names,
+                                                             parameter_sizes,
+                                                             mini_batch_logit_embeddings,
+                                                             logit_embeddings,
+                                                             strategy)
+            # store the output gradient (might be None) in `self._curr_avg_full_grad`
+            self._curr_avg_full_grad = curr_avg_full_grad
+            if data is not None:
+                self.data.append(data)
+
+    @torch.no_grad()
+    def after_backward(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate, **kwargs):
+        """
+        Callback called after each backward pass.
+
+        It gets executed according to the value of `self.excl_exps`, `self.frequency` and
+        `strategy.clock.train_exp_iterations`.
+
+        If executed, and `self._curr_avg_full_grad` is not None, it replaces the original gradient wrt to each network
+        parameter, stored in the corresponding `grad` attribute, with the corresponding gradient encoded within
+        `self._curr_avg_full_grad`.
+        """
+        counter = strategy.clock.train_exp_iterations
+        # if the ID of the current training experience is not in `self.excl_exps` and it is time for an intervention,
+        # then perform the intervention
+        if counter % self.frequency == 0 and strategy.experience.current_experience not in self.excl_exps:
+            if self._curr_avg_full_grad is not None:
+                # detach and clone the average full-gradient that needs to be used by the optimizer to update the
+                # network parameters
+                curr_avg_full_grad = self._curr_avg_full_grad.detach().clone()
+                # get all the parameter tensors in the underlying model, except for those associated with the outlier
+                # detector
+                params = [p for n, p in self._named_parameters_stable(strategy.model)]
+                # get the number of weights in each parameter
+                parameter_sizes = [p.numel() for p in params]
+                # initialize the starting index
+                start = 0
+                for i, p in enumerate(params):
+                    if p.grad is None:
+                        raise RuntimeError("The `grad` attribute of each parameter in the underlying model, except for "
+                                           "that of parameters in the outlier detector, is expected to be not None")
+                    p_flattend_grad = curr_avg_full_grad[start: start + parameter_sizes[i]]
+                    p.grad = p_flattend_grad.reshape_as(p.grad)
+                    start = start + parameter_sizes[i]
+                # set it back to None
+                self._curr_avg_full_grad = None
+
+    def _get_average_mini_batch_full_gradients(self,
+                                               strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
+                                               **kwargs) -> torch.Tensor:
+        """
+        Capture the first input element for the `self.intervention` callable, i.e. the average mini-batch full-gradient
+        for each past class and the average mini-batch full-gradient for the new-class samples.
+
+        This method is called by the `before_backward` callback.
+        """
+        # get the current logits output and the associated targets
+        logits, y = strategy.mb_output_incremental_classifier, strategy.mb_y_incremental_classifier
+        # get the total number of classes seen so far from the current logits output
+        n_classes = logits.shape[1]
+        # get the number of old classes by subtracting to the total number the number of classes in the current
+        # experience
+        n_old_classes = n_classes - len(strategy.experience.classes_in_this_experience)
+        # get all the parameters in the underlying model, except for those associated with the outlier detector
+        params = [x[1] for x in self._named_parameters_stable(strategy.model)]
+        # get the size of each average mini-batch full-gradient
+        grad_size = sum([p.numel() for p in params])
+        # construct the matrix that will store the average mini-batch full-gradients, initially filled with NaNs
+        mini_batch_full_grad = torch.full((n_old_classes+1, grad_size), fill_value=float('nan'),
+                                          dtype=logits.dtype, device=logits.device)
+        for i in range(n_old_classes + 1):
+            # a mask for retrieving logits and targets of the given past class
+            if i < n_old_classes:
+                mask = y == i
+            else:  # a mask for retrieving logits and targets of the new-class samples
+                mask = y >= i
+
+            class_logits = logits[mask]
+            class_y = y[mask]
+            if len(class_logits) > 0:
+                # compute the loss from `class_logits` and `class_y`
+                loss = strategy._criterion(class_logits, class_y)
+                # grads is a tuple of tensors, one tensor for each model parameter provided as input
+                grads = torch.autograd.grad(loss, params, retain_graph=True, materialize_grads=True)
+                # flatten each grad in grads, detach each of them and then concatenate all of them in a single 1D tensor
+                avg_grad = torch.cat([torch.flatten(grad).detach() for grad in grads], dim=0)
+                # insert the average mini-batch full-gradient computed for a given past class or for the new-class
+                # samples into `mini_batch_full_grad`
+                mini_batch_full_grad[i] = avg_grad
+
+        return mini_batch_full_grad
+
+    def _get_mini_batch_logit_embeddings(self,
+                                         strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
+                                         **kwargs) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Capture the sixth input element for the `self.intervention` callable, i.e. the predicted raw logits for
+        the samples in the current mini-batch, corresponding embeddings (feature vectors), corresponding targets,
+        and corresponding indices
+
+        This method is called by the `before_backward` callback.
+        """
+        return (strategy.mb_output_incremental_classifier, strategy.mb_feature_incremental_classifier,
+                strategy.mb_y_incremental_classifier, strategy.mb_dataset_indices)
+
+    def _get_average_full_gradients(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
+                                    avg_mini_batch_full_grads: torch.Tensor, mini_batch_size: torch.Tensor,
+                                    **kwargs) -> torch.Tensor:
+        """
+        Capture the third input element for the `self.intervention` callable, i.e. the average full-gradient for each
+        past class i computed over its entire training dataset or a vector of NaNs according to the value of
+        `self.only_past_classes_orig_full_grads`.
+
+        This method calls `strategy.eval_with_grad` to compute the average full-gradients.
+        The `after_eval_iteration` callback (which then delegates to
+        `self._after_eval_iteration_average_full_gradients`) is used as helper.
+
+        During the `strategy.eval_with_grad` calls performed by this callback, the metrics in `EvaluationPlugin` are not
+        computed as they would be meaningless and their computation would only be a computational overhead.
+
+        This method is called by the `before_backward` callback.
+
+        .note::
+            This plugin *assumes* that the loss function in use computes the average value across the samples in the
+            current mini-batch
+
+        .note::
+            This plugin *assumes* that no same class is present in distinct experiences
+
+        :param strategy: a strategy
+        :param avg_mini_batch_full_grads: a 2D tensor containing the average mini-batch full-gradients for each past
+            class
+        :param mini_batch_size: a 1D tensor containing the number of training samples in the current mini-batch for each
+            past class
+        :param kwargs: custom arguments
+        """
+        # get the classes seen by the single subnetwork, i.e. all the classes encountered so far
+        all_classes = list(strategy.model.subnetworks_classes.values())[0]
+        # get the total number of classes seen by the single subnetwork so far
+        n_classes = len(all_classes)
+        # get the number of old classes by subtracting to the total number the number of classes in the current
+        # experience
+        n_old_classes = n_classes - len(strategy.experience.classes_in_this_experience)
+        # get the current logits output
+        logits = strategy.mb_output_incremental_classifier
+        # get all the parameters in the underlying model, except for those associated with the outlier detector
+        params = [x[1] for x in self._named_parameters_stable(strategy.model)]
+        # get the size of each average full-gradient
+        grad_size = sum([p.numel() for p in params])
+        # construct the matrix that will store the average full-gradients, initially filled with NaNs
+        avg_full_grads = torch.full((n_old_classes , grad_size), fill_value=float('nan'),
+                                          dtype=logits.dtype, device=logits.device)
+
+        # indicate that the next `strategy.eval_with_grad` calls are performed by this method
+        self._eval_called = "full_gradients"
+        # get the evaluator
+        evaluator: EvaluationPlugin = [plg for plg in strategy.plugins if isinstance(plg, EvaluationPlugin)][0]
+        # this will deactivate the evaluator, i.e. metrics are not computed during the next eval calls.
+        evaluator.active = False
+        if self.mb_size is not None:
+            # If not None,  store the eval_mb_size of the strategy and set it to the value of `self.mb_size`
+            eval_mb_size = strategy.eval_mb_size
+            strategy.eval_mb_size = self.mb_size
+
+        # get the ID of the current training experience
+        exp_id = strategy.experience.current_experience
+        # get the dataset_indices of the samples in the current mini-batch and convert it into a set
+        mb_indices = set(strategy.mb_dataset_indices.cpu().tolist())
+
+        for i, target in enumerate(all_classes[:n_old_classes]):
+            # if the ID of the current training experience is a key in `self.only_past_classes_orig_full_grads` and the
+            # current past class is not in the associated set, then no average full-gradient must be computed for this
+            # past class
+            if (exp_id in self.only_past_classes_orig_full_grads.keys() and
+                i not in self.only_past_classes_orig_full_grads[exp_id]):
+                continue
+            # a list containing the training experiences containing the given class
+            exps = [exp for target_set, exp in self._exps.items() if target in target_set]
+            if len(exps) == 0:
+                raise RuntimeError("No experience in `self._exps` contains the given class")
+            elif len(exps) > 1:
+                raise RuntimeError("Multiple experiences in `self._exps` contain the given class")
+            # get the unique experience containing the given class
+            target_exp = exps[0]
+            # get the dataset associated with the unique experience containing the given class
+            train_dataset = target_exp.dataset
+            # get all the training samples belonging to the given class
+            target_train_dataset = train_dataset.subset([i for i, cls in enumerate(train_dataset.targets.data)
+                                        if int(cls) == target])
+            if len(target_train_dataset) == 0:
+                raise RuntimeError("The original training dataset of this class contains no samples.")
+            # if there are samples in the current mini-batch belonging to the given past class
+            if mini_batch_size[i] > 0:
+                # incorporate the average mini-batch full-gradient of the given past class when computing the average
+                # full-gradient over its entire training dataset
+                self._average_full_gradient = (avg_mini_batch_full_grads[i], mini_batch_size[i].item())
+                # keep from `target_train_dataset` only those samples that are not currently in the mini-batch
+                target_train_dataset = target_train_dataset.subset(
+                    [i for i, d_index in enumerate(target_train_dataset.dataset_indices.data)
+                     if int(d_index) not in mb_indices])
+                if len(target_train_dataset) == 0:
+                    raise RuntimeError("`target_train_dataset` contains no samples after removing those in the current "
+                                       "mini-batch.")
+
+            # replace the original dataset of `target_exp` with `target_train_dataset`
+            target_exp.dataset = target_train_dataset
+            # start the eval phase enabled with gradient computation
+            strategy.eval_with_grad(target_exp, **kwargs)
+            # restore the original dataset
+            target_exp.dataset = train_dataset
+            # insert the average full-gradient of the given past class computed over all its training samples
+            # into `avg_full_grads`
+            avg_full_grads[i] = self._average_full_gradient[0]
+            # reset to None
+            self._average_full_gradient = None
+
+        self._eval_called = "no"  # set the flag to "no"
+        # active the evaluator back again, so that metrics are computed when eval is not called by this plugin
+        evaluator.active = True
+        if self.mb_size is not None:
+            # restore to its previous value
+            strategy.eval_mb_size = eval_mb_size
+
+        return avg_full_grads
+
+    def _get_logit_embeddings(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
+                              **kwargs) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Capture the seventh input element for the `self.intervention` callable, i.e.  the predicted raw logits,
+        embeddings (feature vectors), targets and indices of the samples in `self._logits_embeds_dataset`.
+
+        If `self._logits_embeds_dataset` contains at least one training sample,
+        this method calls `strategy.eval` on the first experience in `self._exps`
+        (replacing its dataset with `self._interv_dataset` and restoring the original one once finished) to capture the
+        above information. The `after_eval_iteration` callback (which then delegates to
+        `self._after_eval_iteration_logit_embeddings`) is used as helper.
+
+        During the `strategy.eval` call performed by this callback, the metrics in `EvaluationPlugin` are not
+        computed as they would be meaningless and their computation would only be a computational overhead.
+
+        This method is called by the `before_backward` callback.
+
+        :param strategy: a strategy
+        :param kwargs: custom arguments
+        :return: a tuple containing the collected raw logits as first element,
+            the corresponding embeddings (feature vectors) as second element, the corresponding targets as third
+            element, and the corresponding indices as fourth element. If `self._logits_embeds_dataset` contains no
+            training samples, the raw logits, embeddings, targets and indices are just empty.
+        """
+        if self._logits_embeds_dataset is None:
+            raise RuntimeError("Raw logits, embeddings, targets and indices cannot be captured from the samples in "
+                               "`self._logits_embeds_dataset` because the latter is None")
+
+        # get the predicted raw logits for the samples in the current mini-batch, corresponding embeddings
+        # (feature vectors), corresponding targets, and corresponding indices
+        mb_logits, mb_embeds, mb_targets, mb_indices = self._get_mini_batch_logit_embeddings(strategy, **kwargs)
+
+        # if `self._logits_embeds_dataset` contains at least one training sample
+        if len(self._logits_embeds_dataset) > 0:
+            if len(self._exps) == 0:
+                raise RuntimeError("`self._exps` must contain at least one training experience")
+            # indicate that the next `strategy.eval` call is performed by this method
+            self._eval_called = "logit_embeddings"
+            # get the evaluator
+            evaluator: EvaluationPlugin = [plg for plg in strategy.plugins if isinstance(plg, EvaluationPlugin)][0]
+            # this will deactivate the evaluator, i.e. metrics are not computed during the next eval call
+            evaluator.active = False
+
+            # get the first experience in `self._exps`
+            first_exp = list(self._exps.values())[0]
+            # store the original dataset of the first experience
+            orig_dataset = first_exp.dataset
+            # replace the original dataset with `self._logits_embeds_dataset`
+            first_exp.dataset = self._logits_embeds_dataset
+            # start the eval phase for the given experience
+            strategy.eval(first_exp, **kwargs)
+            # restore the original dataset
+            first_exp.dataset = orig_dataset
+
+            # set the flag to "no"
+            self._eval_called = "no"
+            # active the evaluator back again, so that metrics are computed when eval is not called by this plugin
+            evaluator.active = True
+
+            # get the collected raw logits, embeddings (feature vectors), targets and indices.
+            # They were collected by the `after_eval_iteration` callback (which delegates to
+            # `self._after_eval_iteration_logit_embeddings`) during the `strategy.eval` call performed above.
+            logits, embeds, targets, indices = self._logit_embeddings.result()
+            # reset to its initial state
+            self._logit_embeddings.reset()
+
+            # if logits and embeddings have been collected for samples that are also in the current mini-batch,
+            # replace the collected information for those samples with their actual mini-batch logits and embeddings
+            update_rows_by_id(t1=logits, t2=mb_logits, id1=indices, id2=mb_indices, in_place=True)
+            update_rows_by_id(t1=embeds, t2=mb_embeds, id1=indices, id2=mb_indices, in_place=True)
+
+        else:
+            logits, embeds, targets, indices = (mb_logits.new_empty((0, mb_logits.shape[1])),
+                                                mb_embeds.new_empty((0, mb_embeds.shape[1])),
+                                                mb_targets.new_empty((0,)),
+                                                mb_indices.new_empty((0,)))
+
+        return logits, embeds, targets, indices
+
+    def after_eval_iteration(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate, **kwargs):
+        """
+        Callback called after each eval iteration.
+
+        According to the value of `self._eval_called`, it executes `self._after_eval_iteration_logit_embeddings`,
+        `self._after_eval_iteration_average_full_gradients` or nothing at all.
+
+        :param strategy: a strategy
+        :param kwargs: some keyword arguments
+        """
+        if self._eval_called == "logit_embeddings":
+            self._after_eval_iteration_logit_embeddings(strategy, **kwargs)
+        elif self._eval_called == "full_gradients":
+            self._after_eval_iteration_average_full_gradients(strategy, **kwargs)
+
+    def _after_eval_iteration_average_full_gradients(self,
+                                                     strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
+                                                     **kwargs):
+        """
+        Capture the average full-gradient of the samples in the current mini-batch and update
+        `self._average_full_gradient` accordingly
+
+        This method is called by the `after_eval_iteration` callback if the value of `self._eval_called` is equal to
+        `full_gradients`.
+
+        .note::
+            It is *assumed* that the loss function in use computes the average value across the samples in the
+            current mini-batch
+
+        :param strategy: a strategy
+        :param kwargs: some keyword arguments
+        """
+        curr_sub_id = strategy.curr_sub_id  # store the current state of the strategy's subnetwork id
+        subs_id = list(strategy.mb_output.keys())
+        if len(subs_id) > 1:
+            raise RuntimeError("This plugin must be used only when there is one subnetwork")
+        strategy.curr_sub_id = subs_id[0]
+        # get the number of samples in the current mini-batch
+        n_samples = len(strategy.mb_y_incremental_classifier)
+        # get the loss
+        loss = strategy.loss[strategy.curr_sub_id]
+        # get all the parameters in the underlying model, except for those associated with the outlier detector
+        params = [x[1] for x in self._named_parameters_stable(strategy.model)]
+        # grads is a tuple of tensors, one tensor for each model parameter provided as input
+        grads = torch.autograd.grad(loss, params, materialize_grads=True)
+        # flatten each grad in grads, detach each of them and then concatenate all of them in a single 1D tensor
+        avg_grad = torch.cat([torch.flatten(grad).detach() for grad in grads], dim=0)
+        if self._average_full_gradient is None:
+            self._average_full_gradient = (avg_grad, n_samples)
+        else:
+            avg_grad_so_far, n_samples_so_far = self._average_full_gradient
+            avg_grad_so_far = (avg_grad_so_far * n_samples_so_far + avg_grad * n_samples) / (n_samples_so_far + n_samples)
+            n_samples_so_far = n_samples + n_samples_so_far
+            self._average_full_gradient = (avg_grad_so_far, n_samples_so_far)
+
+        strategy.curr_sub_id = curr_sub_id  # re-store the state of the strategy's subnetwork id
+
+    def _after_eval_iteration_logit_embeddings(self,
+                                              strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
+                                              **kwargs):
+        """
+        Capture the predicted raw logits, embeddings (feature vectors), targets and indices of the samples in
+        the current mini-batch.
+
+        This method is called by the `after_eval_iteration` callback if the value of `self._eval_called` is equal to
+        `logit_embeddings`
+        :param strategy: a strategy
+        :param kwargs: some keyword arguments
+        """
+        curr_sub_id = strategy.curr_sub_id  # store the current state of the strategy's subnetwork id
+        subs_id = list(strategy.mb_output.keys())
+        if len(subs_id) > 1:
+            raise RuntimeError("This plugin must be used only when there is one subnetwork")
+        strategy.curr_sub_id = subs_id[0]
+        if "dataset_indices" not in strategy.use_in_getitem_indices.keys():
+            raise RuntimeError("The dataset of the current training experience must have the `dataset_indices` "
+                               "DataAttribute")
+        indices = strategy.mb_dataset_indices
+        self._logit_embeddings.update(strategy.mb_output_incremental_classifier,
+                                      strategy.mb_y_incremental_classifier,
+                                      strategy.mb_feature_incremental_classifier,
+                                      indices=indices)
+        strategy.curr_sub_id = curr_sub_id  # re-store the state of the strategy's subnetwork id
+
+    def _named_parameters_stable(self, model: nn.Module) -> List[Tuple[str, nn.Parameter]]:
+        """
+        Return a list sorted by name of 2-tuples containing **all** the names and actual parameter tensors in a given
+        module. However, it does not include those parameters associated with a name including the substring
+        `outlier_detector`
+        :param model: a python module
+        """
+        return sorted([(n, p) for n, p in model.named_parameters() if "outlier_detector" not in n],
+                      key=lambda x: x[0])
+
+
 class ClassWiseReplayFullDataAvgFullGradientSchedulerPluginDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate(
     DynamicNetworkInitFeatureExtractorIncrementalOutlierPlugin, supports_distributed=True):
     """
     Class-wise replay and full-data average full-gradient scheduler plugin
     for :class:`DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate`.
 
-    This plugin schedules a periodic computation of *average* full-gradients (gradients wrt all parameters) for each
-    class at distinct optimisation points during the SGD training path. For each class, two different average
-    full-gradients are computed at each optimization point: (1) the average full-gradient across *all* training
-    samples of that class and (2) the average full-gradient across the training samples of that class currently stored
-    in the replay buffer. If a class has no training samples currently stored in the replay buffer then no gradients are
-    tracked for it. Therefore, during the first incremental step, no gradients are tracked because no class has
-    samples currently stored in the replay buffer.
+    This plugin schedules a periodic computation of **average** full-gradients (gradients wrt all parameters)
+    at distinct optimisation points during the SGD training path of **each** experience for **all** the classes
+    encountered so far (both the classes in the current experience and the classes in the previously encountered
+    experiences).
+    For each past class, two different average full-gradients are computed: (1) the average
+    full-gradient over **all** training samples of that class (the original training dataset of that class) and
+    (2) the average full-gradient over the training samples of that class currently stored in the replay buffer. For
+    each new class, only its average full-gradient over **all** its training samples is computed.
 
     .note::
         This plugin *assumes* that the "dataset_indices" DataAttribute is present in the datasets of the **training**
         experiences
+
+    .note::
+        This plugin *assumes* that the underlying model is an instance of :class:`NetworkClassIncremental`;
+        a :class:`RuntimeError` is raised otherwise.
 
     .note::
         This plugin metric *only* works when there is *only* one subnetwork.
@@ -3296,22 +4679,66 @@ class ClassWiseReplayFullDataAvgFullGradientSchedulerPluginDynamicNetworkInitFea
         current batch
 
     .note::
-        This plugin *assumes* that no same class is present in distinct experiences
+        This plugin *assumes* that training is performed on training experiences, i.e.,
+        `experience.origin_stream.name == "train"`; a :class:`RuntimeError` is raised otherwise.
+
+    .note::
+        This plugin *assumes* that no same class is present in distinct experiences.
+
+    .note::
+        This plugin *assumes* that no same training experience (with the same ID) is encoutenred more than once.
+        A :class:`RuntimeError` is raised otherwise.
+
+    .note::
+        This plugin *assumes* that at least one training sample is stored in the replay buffer for each past class.
+        A :class:`RuntimeError` is raised otherwise.
+
+    .note::
+        This plugin *assumes* that an instance of
+        :class:`ReplayNoOutlierPluginDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate` is present as a
+        plugin in the given strategy. A :class:`RuntimeError` is raised, otherwise.
 
     .note::
         The class targets used in this plugin are not the real class targets but the order in which
         classes appear in the list of classes seen by the single subnetwork accessible through
         `strategy.model.subnetworks_classes[id_of_the_single_subnetwork]
     """
-    def __init__(self, storage_policy: ClassBalancedBufferDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
-                 mb_size: Optional[int] = None, frequency: Union[Tuple[int, int], int] = 0,
-                 frequency_mode: Literal["epoch", "iteration", "both"] = "epoch", do_initial: bool = False):
+
+    def __init__(self,
+                 analyzer: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[str], torch.Tensor,
+                                     DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate], Any],
+                 mb_size: Optional[int] = None,
+                 frequency: Union[Tuple[int, int], int] = 0,
+                 frequency_mode: Literal["epoch", "iteration", "both"] = "epoch",
+                 do_initial: bool = False,
+                 transform: Literal["train", "eval"] = "eval",
+                 excl_exps: Optional[Iterable[int]] = None
+                 ):
         """
         Create a new
         ClassWiseReplayFullDataAvgFullGradientSchedulerPluginDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate
-        :param storage_policy: the policy that controls how to add new exemplars in the external memory buffer. It must
-        be an instance of :class:`ClassBalancedBufferDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate`;
-        otherwise a :class:`ValueError` is raised. It *must* be the same instance used in the underlying strategy.
+
+        :param analyzer: a callable that takes in seven elements as input and outputs any element. This is called
+            each time the average full-gradients are computed. The first input element is a 2D tensor containing in
+            each ith row the average full-gradient of class i over **all** its training samples;
+            its shape is (n_classes x grad_size), where `n_classes` is the total number of classes encountered so far
+            (old classes +  new classes) and `grad_size` is the size of the average full-gradient. The second input
+            element is a 2D tensor containing in each ith row the average full-gradient of past class i over its
+            training samples currently stored in the replay buffer; its shape is (n_past_classes x grad_size),
+            where `n_past_classes` is the number of **past** classes encountered so far and `grad_size` is the size
+            of the average full-gradient. During the first experience, `n_past_classes` is obviously 0.
+            The third element is a 1D tensor, of length equal to `n_classes`, containing at each ith index the total
+            number of samples in the original training dataset of class i.
+            The fourth element is a 1D tensor, of length equal to `n_past_classes`, containing at each ith index the
+            number of samples currently stored in the replay buffer for past class i. The fifth element is a list
+            containing the names of the network parameters used to compute the full gradients; the order of the names
+            matches the order used to compute the full-gradients. The sixth element is a 1D tensor, of same length as
+            the list of parameter names, containing at each ith index the number of elements (weights)
+            present in the respective parameter name.
+            The seventh element is a reference to the underlying strategy template. The output element can be of any
+            kind. If the latter is not None, it is appended into `self.data`, which is a list storing desired
+            information at each point in optimisation space scheduled for gradient computations; otherwise,
+            nothing is appended.
         :param mb_size: mini-batch size used when computing the average full-gradients for each class. If None,
             `strategy.eval_mb_size` is used. Default is None.
         :param frequency: the frequency used to compute the full-gradients at different points in the optimisation
@@ -3333,10 +4760,17 @@ class ClassWiseReplayFullDataAvgFullGradientSchedulerPluginDynamicNetworkInitFea
         :param do_initial: whether to compute the full-gradients before the SGD training path starts for the current
             experience, i.e. the gradients are computed using the initial weights. When `frequency` is set to -1,
             this parameter must be set to True; otherwise a :class:`ValueError` is raised. Default is False.
+        :param transform: either `train` or `eval`. The type of transformations to apply to the training samples when
+            computing the average full-gradients. These transformations are the ones used by the
+            underlying benchmark. Usually, the `train` transformations perform sample-wise random modification,
+            such as random cropping, color jittering, etc., while the `eval` transformations do not apply modifications
+            to the samples. Default is `eval`.
+        :param excl_exps: an iterable containing the IDs of the training experiences during which average full-gradients
+            must not be computed. If None, average full-gradients are computed during each training experience.
+            Default is None.
         """
-        if not isinstance(storage_policy, ClassBalancedBufferDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate):
-            raise ValueError("storage_policy must be an instance of "
-                             "ClassBalancedBufferDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate")
+        if transform not in ["train", "eval"]:
+            raise ValueError("transform must be equal to 'train' or 'eval'")
         if frequency_mode not in ["epoch", "iteration", "both"]:
             raise ValueError("frequency_mode must be either `epoch` or `iteration` or `both`")
         if isinstance(frequency, tuple):
@@ -3354,10 +4788,30 @@ class ClassWiseReplayFullDataAvgFullGradientSchedulerPluginDynamicNetworkInitFea
 
         super().__init__()
 
-        self.storage_policy: ClassBalancedBufferDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate = storage_policy
+        self.analyzer: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, List[str], torch.Tensor,
+                                     DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate], Any] = analyzer
         """
-        the policy that controls how to add new exemplars in the external memory buffer.
-        It *must* be the same instance used in the underlying strategy.
+        a callable that takes in seven elements as input and outputs any element. This is called
+        each time the average full-gradients are computed. The first input element is a 2D tensor containing in
+        each ith row the average full-gradient of class i over **all** its training samples;
+        its shape is (n_classes x grad_size), where `n_classes` is the total number of classes encountered so far
+        (old classes +  new classes) and `grad_size` is the size of the average full-gradient. The second input
+        element is a 2D tensor containing in each ith row the average full-gradient of past class i over its
+        training samples currently stored in the replay buffer; its shape is (n_past_classes x grad_size),
+        where `n_past_classes` is the number of **past** classes encountered so far and `grad_size` is the size
+        of the average full-gradient. During the first experience, `n_past_classes` is obviously 0.
+        The third element is a 1D tensor, of length equal to `n_classes`, containing at each ith index the total number
+        of samples in the original training dataset of class i.
+        The fourth element is a 1D tensor, of length equal to `n_past_classes`, containing at each ith index the
+        number of samples currently stored in the replay buffer for past class i. The fifth element is a list
+        containing the names of the network parameters used to compute the full gradients; the order of the names
+        matches the order used to compute the full-gradients. The sixth element is a 1D tensor, of same length as
+        the list of parameter names, containing at each ith index the number of elements (weights)
+        present in the respective parameter name.
+        The seventh element is a reference to the underlying strategy template. The output element can be of any
+        kind. If the latter is not None, it is appended into `self.data`, which is a list storing desired
+        information at each point in optimisation space scheduled for gradient computations; otherwise,
+        nothing is appended.
         """
 
         self.mb_size: Optional[int] = mb_size
@@ -3393,38 +4847,39 @@ class ClassWiseReplayFullDataAvgFullGradientSchedulerPluginDynamicNetworkInitFea
         full-gradients are computed using the initial weights. It must be True when `self.frequency` is -1
         """
 
-        self.all_gradients: Dict[int, List[np.ndarray]] = defaultdict(list)
+        self.transform: Literal["train", "eval"] = transform
         """
-        a dictionary with target labels as keys and lists as values. Each element in the list is a distinct 2d array
-        computed at different time steps. Each 2d array has size (2, number of network parameters), where the first row
-        contains the average full-gradient across *all* training samples of that class and the second row contains the 
-        the average full-gradient across the training samples of that class currently stored in the replay buffer.
-        The target labels are not the real target labels but the order in which classes appear in the list of classes
-        seen by the unique subnetwork accessible through `strategy.model.subnetworks_classes[sub_id]`.
-        """
-
-        self._exps: Dict[FrozenSet[int], CLExperience] = {}
-        """
-        a dictionary containing the training experiences encountered so far as values. The respective key of each
-        experience is a set (frozenset because it is hashable) containing the target labels in the training dataset of
-        that experience. The target labels are those output by the underlying CL benchmark
+        either `train` or `eval`. The type of transformations to apply to the training samples when
+        computing the average full-gradients. These transformations are the ones used by the
+        underlying benchmark. Usually, the `train` transformations perform sample-wise random modification,
+        such as random cropping, color jittering, etc., while the `eval` transformations do not apply modifications
+        to the samples.
         """
 
-        self._current_target_label_dataset_indices: Optional[Union[int, Set[int]]] = None
+        self.excl_exps: Set[int] = set() if excl_exps is None else set(excl_exps)
         """
-        always None except when `strategy.eval_with_grad` is called by `self._compute_gradients`. When not None, 
-        it is either an integer or a set of integers. If an integer, it is the target label for the class whose average
-        full-gradient needs to be computed across all of its training samples. If a set of integers, it is a set
-        containing the `dataset_indices` DataAttribute of those samples whose average full-gradient needs to be
-        computed. These are all samples belonging to a specific class that are currently stored in the memory buffer.
+        a set containing the IDs of the training experiences during which average full-gradients must not be computed.
         """
 
-        self._average_full_gradient: Optional[Tuple[np.ndarray, int]] = None
+        self.data: List[Any] = []
+        """
+        a list storing desired information at each point in optimisation space scheduled for average full-gradients
+        computation. At each point in optimisation space (scheduled for average full-gradients computation),
+        this list is appended with the output returned by `self.analyzer` at that point, unless that element is None.  
+        """
+
+        self._exps: OrderedDict[FrozenSet[int], CLExperience] = OrderedDict()
+        """
+        an ordered dictionary containing the training experiences encountered so far as values.
+        The respective key of each experience is a set (frozenset because it is hashable) containing the target labels
+        in the training dataset of that experience. The target labels are those output by the underlying CL benchmark
+        """
+
+        self._average_full_gradient: Optional[Tuple[torch.Tensor, int]] = None
         """
         always None except when `strategy.eval_with_grad` is called by `self._compute_gradients`. When not None, it is a
-        2-tuple where the first element is a 1D numpy array of the average full-gradient computed so far for the samples
-        specified by `self._current_target_label_dataset_indices` and the second element is the number of samples used
-        for computing the average so far.
+        2-tuple where the first element is a 1D tensor of the average full-gradient computed so far 
+        and the second element is the number of samples used for computing the average so far.
         """
 
         self._eval_called: bool = False
@@ -3440,25 +4895,40 @@ class ClassWiseReplayFullDataAvgFullGradientSchedulerPluginDynamicNetworkInitFea
         :param strategy: a strategy
         :param kwargs: some keyword arguments
         """
-        if strategy.experience.origin_stream.name == "train":  # if it is a training experience
-            new_exp_id = strategy.experience.current_experience  # get the ID of the training experience
-            # if this experience has not been encountered before
-            if new_exp_id not in [exp.current_experience for exp in self._exps.values()]:
-                key = frozenset(strategy.experience.dataset.targets)
-                # append the new training experience along with its set of target labels
-                self._exps[key] = strategy.experience
+        if strategy.experience.origin_stream.name != "train":  # if it is not a training experience
+            raise RuntimeError("Training must be performed only on training experiences.")
+
+        new_exp_id = strategy.experience.current_experience  # get the ID of the training experience
+        # if this experience has been encountered before
+        if new_exp_id in [exp.current_experience for exp in self._exps.values()]:
+            raise RuntimeError("This training experience was encountered before.")
+
+        # get the dataset associated with the new training experience
+        new_exp_dataset = strategy.experience.dataset
+        if len(new_exp_dataset) == 0:
+            raise RuntimeError("The dataset associated with the new training experience is empty")
+        if not hasattr(new_exp_dataset, "dataset_indices"):
+            raise RuntimeError("The dataset associated with the new training experience does not contain the "
+                               "`dataset_indices` DataAttribute")
+
+        key = frozenset(strategy.experience.dataset.targets)
+        # add the new training experience along with its set of target labels
+        self._exps[key] = strategy.experience
 
     def after_train_datasets_adaptation(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
                                         **kwargs):
         """
         Callback called after the train datasets adaptation
 
-        This callback verifies that there is a single subnetwork by checking that `strategy.adapted_dataset` contains
-        the dataset of a single subnetwork. If there are multiple subnetworks, this callback raises
-        a :class`RuntimeError`.
+        This callback verifies that (1) `strategy.model` is an instance of :class:`NetworkClassIncremental`, and (2)
+        there is a single subnetwork by checking that `strategy.adapted_dataset` contains
+        the dataset of a single subnetwork. If one or both of the two checks are negative, this callback raises
+        a :class:`RuntimeError`.
         :param strategy: a strategy
         :param kwargs: some keyword arguments
         """
+        if not isinstance(strategy.model, NetworkClassIncremental):
+            raise RuntimeError("The underlying model must be an instance of class `NetworkClassIncremental`")
         if len(strategy.adapted_dataset) > 1:
             raise RuntimeError("This plugin only works when there is a single subnetwork")
 
@@ -3468,12 +4938,12 @@ class ClassWiseReplayFullDataAvgFullGradientSchedulerPluginDynamicNetworkInitFea
         Callback called before the training loop of the single subnetwork.
 
         Compute the full-gradients at the current optimisation point before the training loop starts if
-        `self.do_initial` is True
+        `self.do_initial` is True and the ID of the current experience is not in `self.excl_exps`.
 
         :param strategy: a strategy
         :param kwargs: some keyword arguments
         """
-        if self.do_initial:
+        if self.do_initial and strategy.experience.current_experience not in self.excl_exps:
             self._compute_gradients(strategy, **kwargs)
 
     def after_training_epoch(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate, **kwargs):
@@ -3481,7 +4951,7 @@ class ClassWiseReplayFullDataAvgFullGradientSchedulerPluginDynamicNetworkInitFea
         Callback called at the end of each training epoch.
 
         If `self.frequency_mode` is `epoch` or `both`, the computation of the full-gradients is performed
-        according to the value of `self.frequency` and `strategy.clock.train_exp_epochs`.
+        according to the value of `self.frequency`, `strategy.clock.train_exp_epochs` and `self.excl_exps`.
         """
         if self.frequency_mode in ["epoch", "both"]:
             frequency = self.frequency
@@ -3496,7 +4966,7 @@ class ClassWiseReplayFullDataAvgFullGradientSchedulerPluginDynamicNetworkInitFea
         Callback called at the end of each training iteration.
 
         If `self.frequency_mode` is `iteration` or `both`, the computation of the full-gradients is performed
-        according to the value of `self.frequency` and `strategy.clock.train_exp_iterations`.
+        according to the value of `self.frequency`, `strategy.clock.train_exp_iterations`, and `self.excl_exps`.
         """
         if self.frequency_mode in ["iteration", "both"]:
             frequency = self.frequency
@@ -3512,9 +4982,11 @@ class ClassWiseReplayFullDataAvgFullGradientSchedulerPluginDynamicNetworkInitFea
 
         Compute the full-gradients at the end of the training loop of the single subnetwork.
         The computation of the full-gradients is not performed by this callback if `self.frequency` is -1 or
-        the last periodic computation of the full-gradients was already performed at the convergence point.
+        the last periodic computation of the full-gradients was already performed at the convergence point or
+        the ID of the current experience is in `self.excl_exps`.
         In contrast, the computation of the full-gradients is performed if the last periodic computation was not
-        performed at the convergence point or `self.frequency` is 0.
+        performed at the convergence point or `self.frequency` is 0 and the ID of the current experience is not in
+        `self.excl_exps`.
         """
         compute_final: bool = False
         if isinstance(self.frequency, tuple):
@@ -3537,34 +5009,38 @@ class ClassWiseReplayFullDataAvgFullGradientSchedulerPluginDynamicNetworkInitFea
             elif counter % self.frequency != 0:
                 compute_final = True
 
-        if compute_final:
+        if compute_final and strategy.experience.current_experience not in self.excl_exps:
             self._compute_gradients(strategy, **kwargs)
 
     def _maybe_compute_gradients(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
                                  counter, frequency: int, **kwargs):
         """
         Maybe compute the full-gradients for the single subnetwork.
-        The computation is performed according to the counter and frequency provided.
+        The computation is performed according to the counter, frequency provided and `self.excl_exps`.
         :param strategy: strategy
         :param counter: counter
         :param frequency: frequency
         :param kwargs: custom arguments
         """
-        if frequency > 0 and counter % frequency == 0:
+        if frequency > 0 and counter % frequency == 0 and strategy.experience.current_experience not in self.excl_exps:
             self._compute_gradients(strategy, **kwargs)
 
     def _compute_gradients(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate, **kwargs):
         """
-        Compute the full-gradients for the single subnetwork.
+        Compute the average full-gradients from the single subnetwork.
 
-        This method calls `strategy.eval_with_grad` to compute the full-gradients for each class that has
-        samples stored in `self.storage_policy`. For each class having samples stored in `self.storage_policy`, the
-        average full gradient across all of its training samples and that across its samples stored in
-        `self.storage_policy` are computed.
-
+        This method calls `strategy.eval_with_grad` to compute the **average** full-gradients
+        (gradients wrt all parameters) at the current point in optimization space for **all** the classes
+        encountered so far (both the classes in the current experience and the classes in the previously encountered
+        experiences).
+        For each past class, two different average full-gradients are computed: (1) the average
+        full-gradient over **all** training samples of that class (the original training dataset of that class) and
+        (2) the average full-gradient over the training samples of that class currently stored in the replay buffer. For
+        each new class, only its average full-gradient over **all** its training samples is computed.
+        After the average full-gradients are computed, they (along with other data) are passed to `self.analyzer`. If
+        the output of the latter is not None, it is appended into `self.data`.
 
         The `after_eval_iteration` callback is used to capture the average full-gradients of the current mini-batch.
-
 
         During the `strategy.eval_with_grad` calls performed by this callback, the metrics in `EvaluationPlugin` are not
         computed as they would be meaningless and their computation would only be a computational overhead.
@@ -3588,49 +5064,124 @@ class ClassWiseReplayFullDataAvgFullGradientSchedulerPluginDynamicNetworkInitFea
             # If not None,  store the eval_mb_size of the strategy and set it to the value of `self.mb_size`
             eval_mb_size = strategy.eval_mb_size
             strategy.eval_mb_size = self.mb_size
+        # retrieve the ReplayNoOutlierPluginDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate plugin from the
+        # underlying strategy. A RuntimeError is raised if such a plugin is not present
+        replay = next((x for x in strategy.plugins
+                       if isinstance(x,
+                                     ReplayNoOutlierPluginDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate)),
+                      None)
+        if replay is None:
+            raise RuntimeError("The underlying strategy must have an instance of "
+                               "`ReplayNoOutlierPluginDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate` as "
+                               "a plugin")
+        # get the underlying storage policy from the replay plugin
+        storage_policy = replay.storage_policy
+        # get the set of new classes introduced by the current experience
+        new_classes = set(strategy.experience.classes_in_this_experience)
+        # get the classes seen by the single subnetwork, i.e. all the classes encountered so far
+        all_classes = list(strategy.model.subnetworks_classes.values())[0]
+        # if there are past classes but the replay buffer is empty, raise a RuntimeError
+        if len(all_classes) > len(new_classes) and len(storage_policy.buffer) == 0:
+            raise RuntimeError("The replay buffer is empty even though there are past classes")
 
-        for target_label, buffer in self.storage_policy.buffer_groups.items():
-            dataset = buffer.buffer
-            # if there are actually more than or equal to 1 exemplars stored for this class
-            if len(dataset) > 0:
-                # the `dataset_indices` DataAttribute of the sample of the given class in the memory buffer
-                dataset_indices = set(getattr(dataset, "dataset_indices", None))
+        # it will contain as many elements as the total number of classes encountered so far; each index i will contain
+        # the average full-gradient of class i computed over all its training samples
+        train_avg_full_grads: List[torch.Tensor] = []
+        # it will contain as many elements as the number of past classes; each index i will contain the
+        # average full-gradient of past class i computed over all its training samples currently stored in the
+        # replay buffer
+        reh_avg_full_grads: List[torch.Tensor] = []
+        # it will contain as many elements as the total number of classes encountered so far; each index i will contain
+        # the number of all training samples belonging to class i
+        n_train: List[int] = []
+        # it will contain as many elements as the number of past classes; each index i will contain
+        # the number of training samples belonging to past class i currently stored in the replay buffer
+        n_reh: List[int] = []
+
+        for target in all_classes:
+            # a list containing the training experiences containing the given class
+            exps = [exp for target_set, exp in self._exps.items() if target in target_set]
+            if len(exps) == 0:
+                raise RuntimeError("No experience in `self._exps` contains the given class")
+            elif len(exps) > 1:
+                raise RuntimeError("Multiple experiences in `self._exps` contain the given class")
+            # get the unique experience containing the given class
+            target_exp = exps[0]
+            # get the dataset associated with the unique experience containing the given class
+            train_dataset = target_exp.dataset
+            # get all the training samples belonging to the given class
+            target_train_dataset = train_dataset.subset([i for i, cls in enumerate(train_dataset.targets.data)
+                                        if int(cls) == target])
+            if len(target_train_dataset) == 0:
+                raise RuntimeError("The original training dataset of this class contains no samples.")
+            # append to `n_train` the number of all training samples belonging to the given class
+            n_train.append(len(target_train_dataset))
+
+            # replace the original dataset of `target_exp` with `target_train_dataset`
+            target_exp.dataset = target_train_dataset
+            # start the eval phase enabled with gradient computation
+            strategy.eval_with_grad(target_exp, **kwargs)
+            # restore the original dataset
+            target_exp.dataset = train_dataset
+            # append to `train_avg_full_grads` the average full-gradient of the given class computed over all its
+            # training samples
+            train_avg_full_grads.append(self._average_full_gradient[0])
+            # reset to None
+            self._average_full_gradient = None
+
+            # if the given class is a past class
+            if target not in new_classes:
+                # get the `dataset_indices` DataAttribute of all the samples currently stored in the replay buffer
+                dataset_indices = getattr(storage_policy.buffer, "dataset_indices", None)
                 if dataset_indices is None:
-                    raise RuntimeError("The dataset of the memory buffer of the given class must have the "
+                    raise RuntimeError("The dataset of the replay buffer must have the "
                                        "`dataset_indices` DataAttribute")
-                # a list containing the experiences containing the given class
-                exps = [exp for target_set, exp in self._exps.items() if target_label in target_set]
-                if len(exps) == 0:
-                    raise RuntimeError("No experience in `self._exps` contains the given class")
-                elif len(exps) > 1:
-                    raise RuntimeError("Multiple experiences in `self._exps` contain the given class")
-                # the unique experience containing the given class
-                target_exp = exps[0]
-                # a list that will contain the average gradient across all training samples of the given class in the
-                # first index; the average gradient only across the samples currently stored in the memory buffer in the
-                # second index
-                avg_full_gradients: List[np.ndarray] = []
-                # `strategy_eval_with_grad` is called twice. The first time to compute the average gradient across all
-                # training samples of the given class; the second time to compute the average gradient only across the
-                # samples currently stored in the memory buffer
-                for n in range(2):
-                    # set which target label full-gradients need to computed for if n is equal to 0; otherwise, set which
-                    # exemplars of the given class are currently stored in the memory buffer if n is equal to 1
-                    self._current_target_label_dataset_indices = target_label if n == 0 else dataset_indices
-                    # start the eval phase enabled with gradient computation
-                    strategy.eval_with_grad(target_exp, **kwargs)
-                    # add the computed average full-gradient to `avg_full_gradients`
-                    avg_full_gradients.append(self._average_full_gradient[0])
-                    self._current_target_label_dataset_indices = None  # reset to None
-                    self._average_full_gradient = None  # reset to None
+                # convert it into a set
+                dataset_indices = set(dataset_indices)
+                # get the training samples of the given past class currently stored in the replay buffer
+                target_reh_dataset = target_train_dataset.subset(
+                    [i for i, d_index in enumerate(target_train_dataset.dataset_indices.data)
+                     if int(d_index) in dataset_indices])
+                if len(target_reh_dataset) == 0:
+                    raise RuntimeError("The replay buffer contains no samples belonging to this past class.")
+                # append to `n_reh` the number samples belonging to the given past class currently stored in the
+                # replay buffer
+                n_reh.append(len(target_reh_dataset))
 
-                # get the classes seen by the single subnetwork
-                seen_classes = list(strategy.model.subnetworks_classes.values())[0]
-                # get the index in which the given target label appears in the list of classes seen by the single
-                # subnetwork
-                target_index = seen_classes.index(target_label)
-                # add the average full-gradients
-                self.all_gradients[target_index].append(np.stack(avg_full_gradients, axis=0))
+                # replace the original dataset of `target_exp` with `target_reh_dataset`
+                target_exp.dataset = target_reh_dataset
+                # start the eval phase enabled with gradient computation
+                strategy.eval_with_grad(target_exp, **kwargs)
+                # restore the original dataset
+                target_exp.dataset = train_dataset
+                # append to `reh_avg_full_grads` the average full-gradient of the given past class computed over its
+                # training samples currently stored in the replay buffer
+                reh_avg_full_grads.append(self._average_full_gradient[0])
+                # reset to None
+                self._average_full_gradient = None
+
+        # convert it into a 2D tensor
+        train_avg_full_grads = torch.stack(train_avg_full_grads, dim=0)
+        # convert it into a 2D tensor if not empty; if empty, create an empty 2D tensor of the right shape
+        reh_avg_full_grads = torch.stack(reh_avg_full_grads, dim=0) if len(reh_avg_full_grads) > 0 \
+            else torch.empty((0, train_avg_full_grads.shape[1]), dtype=train_avg_full_grads.dtype,
+                             device=train_avg_full_grads.device)
+        # convert it into a 1D tensor
+        n_train = torch.tensor(n_train, device=train_avg_full_grads.device, dtype=torch.int64)
+        # convert it into a 1D tensor
+        n_reh = torch.tensor(n_reh, device=train_avg_full_grads.device, dtype=torch.int64)
+        # get the name of the parameters and the parameters themselves from the underlying model
+        named_parameters = self._named_parameters_stable(strategy.model)
+        # get the name of the parameters
+        parameter_names = [x[0] for x in named_parameters]
+        # get the number of weights in each parameter and convert it into a 1D tensor
+        parameter_sizes = torch.tensor([x[1].numel() for x in named_parameters], device=train_avg_full_grads.device,
+                                       dtype=torch.int64)
+        # get the output from `self.analyzer`
+        out = self.analyzer(train_avg_full_grads, reh_avg_full_grads, n_train, n_reh, parameter_names, parameter_sizes,
+                            strategy)
+        if out is not None:
+            self.data.append(out)
 
         self._eval_called = False  # reset the flag to false
         # active the evaluator back again, so that metrics are computed when eval is not called by this plugin
@@ -3642,37 +5193,23 @@ class ClassWiseReplayFullDataAvgFullGradientSchedulerPluginDynamicNetworkInitFea
     def after_eval_dataset_adaptation(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
                                       **kwargs):
         """
-        Callback called after each eval dataset adaptation.
+        Callback called after the eval dataset adaptation.
+
+        This callback uses `self.transform` to set the type of transformations to apply to the training samples when
+        collecting any kind of average full-gradient for a given class.
+
         This callback gets executed only if the current eval phase was called by this plugin.
-        This is achieved by looking at the value of `self._eval_called`. This callback **should not** be executed
+        This can be achieved by looking at the value of `self._eval_called`. This callback **should not** be executed
         when the current eval phase was not called by this plugin.
 
-        This callback modifies `strategy.adapted_dataset` by only retaining specific samples according to the value of
-        `self._current_target_label_dataset_indices`. If `self._current_target_label_dataset_indices` is a target label,
-        only those samples belonging to the given target label are retained in `strategy.adapted_dataset`. Otherwise,
-        if `self._current_target_label_dataset_indices` is a set of `dataset_indices` DataAttribute, only those samples
-        with the given `dataset_indices` DataAttribute are retained.
         :param strategy: a strategy
         :param kwargs: some keyword arguments
         """
         if self._eval_called:
-            if self._current_target_label_dataset_indices is None:
-                raise RuntimeError("`self._current_target_label_dataset_indices` cannot be None")
-            elif isinstance(self._current_target_label_dataset_indices, int):
-                # only preserve those samples with the given target label
-                target_label = self._current_target_label_dataset_indices
-                strategy.adapted_dataset = strategy.adapted_dataset.subset(
-                    [i for i, cls in enumerate(strategy.adapted_dataset.targets.data) if int(cls) == target_label]
-                )
-            elif isinstance(self._current_target_label_dataset_indices, set):
-                # only preserve those samples with specific `dataset_indices` DataAttributes
-                dataset_indices = self._current_target_label_dataset_indices
-                strategy.adapted_dataset = strategy.adapted_dataset.subset(
-                    [i for i, d_index in enumerate(strategy.adapted_dataset.dataset_indices.data)
-                     if int(d_index) in dataset_indices]
-                )
+            if self.transform == "train":
+                strategy.adapted_dataset = strategy.adapted_dataset.train()
             else:
-                raise RuntimeError("`self._current_target_label_dataset_indices` is of an unexpected type")
+                strategy.adapted_dataset = strategy.adapted_dataset.eval()
 
     def after_eval_iteration(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate, **kwargs):
         """
@@ -3681,7 +5218,7 @@ class ClassWiseReplayFullDataAvgFullGradientSchedulerPluginDynamicNetworkInitFea
         This can be achieved by looking at the value of `self._eval_called`. This callback **should not** be executed
         when the current eval phase was not called by this plugin.
 
-        Capture the average full-gradient of the samples in the current mini-batch and updates
+        Capture the average full-gradient of the samples in the current mini-batch and update
         `self._average_full_gradient` accordingly
 
         .note::
@@ -3700,11 +5237,12 @@ class ClassWiseReplayFullDataAvgFullGradientSchedulerPluginDynamicNetworkInitFea
             n_samples = len(strategy.mb_y_incremental_classifier)
             # get the loss
             loss = strategy.loss[strategy.curr_sub_id]
+            # get all the parameters in the underlying model
+            params = [x[1] for x in self._named_parameters_stable(strategy.model)]
             # grads is a tuple of tensors, one tensor for each model parameter provided as input
-            grads = torch.autograd.grad(loss, list(strategy.model.parameters()), materialize_grads=True)
-            # flatten each grad in grads, convert it to a numpy array and then concatenate all of them in a single 1d
-            # array
-            avg_grad = np.concatenate([torch.flatten(grad).detach().cpu().numpy() for grad in grads])
+            grads = torch.autograd.grad(loss, params, materialize_grads=True)
+            # flatten each grad in grads, detach each of them and then concatenate all of them in a single 1D tensor
+            avg_grad = torch.cat([torch.flatten(grad).detach() for grad in grads], dim=0)
             if self._average_full_gradient is None:
                 self._average_full_gradient = (avg_grad, n_samples)
             else:
@@ -3715,6 +5253,8 @@ class ClassWiseReplayFullDataAvgFullGradientSchedulerPluginDynamicNetworkInitFea
 
             strategy.curr_sub_id = curr_sub_id  # re-store the state of the strategy's subnetwork id
 
+    def _named_parameters_stable(self, model: nn.Module) -> List[Tuple[str, nn.Parameter]]:
+        return sorted(model.named_parameters(), key=lambda x: x[0])
 
 class GradientBasedReplayBufferSelectionSGDPluginDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate(
     BufferDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
@@ -6175,7 +7715,6 @@ class LrSchedulerPluginDynamicNetworkInitFeatureExtractorIncrementalOutlierTempl
         """
         # creating a scheduler instance for each subnetwork's optimizer
         for sub_id, opt in strategy.optimizer.items():
-            opt.__class__ = torch.optim.SGD
             # create an instance of the scheduler and pass the respective optimizer and any provided keyword arguments
             self.scheduler_instncs[sub_id] = self.scheduler(optimizer=opt, **self.kwargs)
             if self.reset_lrs:

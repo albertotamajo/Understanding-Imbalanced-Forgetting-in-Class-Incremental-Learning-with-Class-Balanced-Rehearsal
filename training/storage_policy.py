@@ -7,7 +7,10 @@ from abc import ABC, abstractmethod
 from typing import Optional, Dict, List, Set, TYPE_CHECKING
 from collections import defaultdict
 
+from llifc.utils import sample_wise_mce_grads_wrt_weights_biases
+
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from numpy import inf
 from avalanche.training.storage_policy import (ClassBalancedBuffer, ExemplarsBuffer, ReservoirSamplingBuffer,
@@ -214,33 +217,43 @@ class HerdingClassBalancedBufferDynamicNetworkInitFeatureExtractorIncrementalOut
             # the respective datasets as values
             adapted_datasets = list(strategy.adapted_dataset.values())  # put the datasets of each subnet into a list
             adapted_datasets = concat_datasets(adapted_datasets)   # the datasets are concatenated into a single dataset
-            # split `adapted_datasets` into as many disjoint subsets as the number of unique classes in
-            # `adapted_datasets`
-            new_groups = self._make_groups(strategy, adapted_datasets)
-            self.seen_groups.update(new_groups.keys())
+            self.update_from_dataset(adapted_datasets, strategy)
 
-            # associate lengths to classes
-            lens = self.get_group_lengths(len(self.seen_groups))
-            group_to_len = {}
-            for group_id, ll in zip(self.seen_groups, lens):
-                group_to_len[group_id] = ll
+    def update_from_dataset(self, new_data: AvalancheDataset,
+                            strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate):
+        """
+        Update buffer using `new_data`.
+        """
+        if len(new_data) == 0:
+            return
 
-            # update buffers with new data
-            for group_id, new_data_g in new_groups.items():
-                ll = group_to_len[group_id]
-                if group_id in self.buffer_groups.keys():
-                    old_buffer_g: SelectionStrategyExemplarsBuffer = self.buffer_groups[group_id]
-                    old_buffer_g.update_from_dataset(new_data_g, strategy)
-                    old_buffer_g.resize(strategy, ll)
-                else:
-                    new_buffer = SelectionStrategyExemplarsBuffer(max_size=ll,
-                                                                  selection_strategy=self.selection_strategy)
-                    new_buffer.update_from_dataset(new_data_g, strategy)
-                    self.buffer_groups[group_id] = new_buffer
+        # split `new_data` into as many disjoint subsets as the number of unique classes in
+        # `adapted_datasets`
+        new_groups = self._make_groups(strategy, new_data)
+        self.seen_groups.update(new_groups.keys())
 
-            # resize buffers
-            for group_id, class_buf in self.buffer_groups.items():
-                self.buffer_groups[group_id].resize(strategy, group_to_len[group_id])
+        # associate lengths to classes
+        lens = self.get_group_lengths(len(self.seen_groups))
+        group_to_len = {}
+        for group_id, ll in zip(sorted(self.seen_groups), lens):
+            group_to_len[group_id] = ll
+
+        # update buffers with new data
+        for group_id, new_data_g in new_groups.items():
+            ll = group_to_len[group_id]
+            if group_id in self.buffer_groups.keys():
+                old_buffer_g: SelectionStrategyExemplarsBuffer = self.buffer_groups[group_id]
+                old_buffer_g.update_from_dataset(new_data_g, strategy)
+                old_buffer_g.resize(strategy, ll)
+            else:
+                new_buffer = SelectionStrategyExemplarsBuffer(max_size=ll,
+                                                              selection_strategy=self.selection_strategy)
+                new_buffer.update_from_dataset(new_data_g, strategy)
+                self.buffer_groups[group_id] = new_buffer
+
+        # resize buffers
+        for group_id, class_buf in self.buffer_groups.items():
+            self.buffer_groups[group_id].resize(strategy, group_to_len[group_id])
 
     def buffer_subnetwork(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
                           sub_id: str) -> AvalancheDataset:
@@ -255,6 +268,116 @@ class HerdingClassBalancedBufferDynamicNetworkInitFeatureExtractorIncrementalOut
         return concat_datasets([self.buffer_groups[cls].buffer
                                 for cls in self.buffer_groups.keys() if cls in sub_classes])
 
+    def resize(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate, new_size):
+        """Update the maximum size of the buffers."""
+        self.max_size = new_size
+        lens = self.get_group_lengths(len(self.seen_groups))
+        for ll, id in zip(lens, sorted(self.seen_groups)):
+            self.buffer_groups[id].resize(strategy, ll)
+
+
+class OfflineGSSClassBalancedBufferDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate(
+    ParametricBuffer, BufferDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate):
+    """
+    Store samples for replay, equally divided over classes.
+
+    There is a separate buffer for each class updated by using an offline greedy variant of the gradient-based
+    selection strategy as described in "Gradient based sample selection for online continual learning". The gradient
+    vectors of single samples are computed wrt the weights and bias in the last layer, assuming multi-class
+    cross entropy loss is the underlying loss.
+
+    When a class is first encountered, the selection strategy selects a subset of samples by greedily selecting
+    at each iteration the remaining exemplar whose gradient vector of the multi-class cross-entropy loss wrt the
+    weights and bias in the last layer is less similar in terms of cosine similarity to the gradient vectors of the
+    already selected exemplars. Later, when the buffer of a class must be reduced in size, the last selected
+    samples are removed to match the new size.
+
+    It should be called in the 'after_training_exp' phase.
+    The number of classes can be fixed up front or adaptive, based on the 'adaptive_size' attribute.
+    When adaptive, the memory is equally divided over all the unique classes observed so far.
+    """
+    def __init__(self, max_size: int, adaptive_size: bool = True, total_num_classes: Optional[int] = None):
+        """
+        Create a new OfflineGSSClassBalancedBufferDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate
+        :param max_size: the overall maximum capacity of the replay memory
+        :param adaptive_size: True if `max_size` is divided equally over all unique classes observed so far.
+        :param total_num_classes: if `adaptive_size` is False, the fixed number of classes to divide capacity over.
+        """
+        BalancedExemplarsBuffer.__init__(self, max_size=max_size, adaptive_size=adaptive_size,
+                                         total_num_groups=total_num_classes)
+        self.groupby = "class"
+        self.selection_strategy: ExemplarsSelectionStrategy = (
+            GSSExemplarsSelectionStrategyDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate())
+        self.seen_groups: Set[int] = set()
+
+    def update(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate, **kwargs):
+        """
+        Update the replay memory by using the samples of the classes contained in the current experience.
+        :param strategy: a strategy
+        :param kwargs: some keyword arguments
+        """
+        if strategy.is_training:  # it does not make sense to update the buffer at evaluation time
+            # when in training mode, `strategy.adapted_dataset` is a dictionary containing subnetwork IDs as keys and
+            # the respective datasets as values
+            adapted_datasets = list(strategy.adapted_dataset.values())  # put the datasets of each subnet into a list
+            adapted_datasets = concat_datasets(adapted_datasets)   # the datasets are concatenated into a single dataset
+            self.update_from_dataset(adapted_datasets, strategy)
+
+    def update_from_dataset(self, new_data: AvalancheDataset,
+                            strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate):
+        """
+        Update buffer using `new_data`.
+        """
+        if len(new_data) == 0:
+            return
+
+        # split `new_data` into as many disjoint subsets as the number of unique classes in
+        # `adapted_datasets`
+        new_groups = self._make_groups(strategy, new_data)
+        self.seen_groups.update(new_groups.keys())
+
+        # associate lengths to classes
+        lens = self.get_group_lengths(len(self.seen_groups))
+        group_to_len = {}
+        for group_id, ll in zip(sorted(self.seen_groups), lens):
+            group_to_len[group_id] = ll
+
+        # update buffers with new data
+        for group_id, new_data_g in new_groups.items():
+            ll = group_to_len[group_id]
+            if group_id in self.buffer_groups.keys():
+                old_buffer_g: SelectionStrategyExemplarsBuffer = self.buffer_groups[group_id]
+                old_buffer_g.update_from_dataset(new_data_g, strategy)
+                old_buffer_g.resize(strategy, ll)
+            else:
+                new_buffer = SelectionStrategyExemplarsBuffer(max_size=ll,
+                                                              selection_strategy=self.selection_strategy)
+                new_buffer.update_from_dataset(new_data_g, strategy)
+                self.buffer_groups[group_id] = new_buffer
+
+        # resize buffers
+        for group_id, class_buf in self.buffer_groups.items():
+            self.buffer_groups[group_id].resize(strategy, group_to_len[group_id])
+
+    def buffer_subnetwork(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
+                          sub_id: str) -> AvalancheDataset:
+        """
+        Get the  rehearsal buffer for a given subnetwork.
+        :param strategy: a :class:`DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate` strategy
+        :param sub_id: ID of a subnetwork
+        :return: a rehearsal dataset of past data for the given subnetwork. If there is no rehearsal buffer for a
+            given subnetwork, an empty dataset is returned.
+        """
+        sub_classes = strategy.model.subnetworks_classes[sub_id]
+        return concat_datasets([self.buffer_groups[cls].buffer
+                                for cls in self.buffer_groups.keys() if cls in sub_classes])
+
+    def resize(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate, new_size):
+        """Update the maximum size of the buffers."""
+        self.max_size = new_size
+        lens = self.get_group_lengths(len(self.seen_groups))
+        for ll, id in zip(lens, sorted(self.seen_groups)):
+            self.buffer_groups[id].resize(strategy, ll)
 
 class SelectionStrategyExemplarsBuffer(ExemplarsBuffer):
     """
@@ -385,6 +508,96 @@ class FeatureBasedExemplarsSelectionStrategyDynamicNetworkInitFeatureExtractorIn
         """
 
 
+class MCELastLayerGradBasedExemplarsSelectionStrategyDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate(
+    ExemplarsSelectionStrategy, ABC):
+    """
+    ABC to select exemplars from their respective sample-wise gradient vectors of the multi-class cross-entropy loss
+    wrt the weights and bias in the last layer
+    for :class:`DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate`.
+
+    Subclasses *must* implement the `make_sorted_indices_from_grads` method.
+
+    .note::
+        This selection strategy *only* works when there is *only* one subnetwork
+    """
+    @torch.no_grad()
+    def make_sorted_indices(self, strategy: DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate,
+                            data: AvalancheDataset, num_workers=0, pin_memory=None, **kwargs) -> List[int]:
+        """
+        Compute the sample-wise gradient vector of the multi-class cross-entropy loss wrt the weights and bias in the
+        last layer for each sample in `data` and return a sorted list of indices for the samples in `data`
+        based on the samples' gradient vectors. The samples in `data` whose indices are the last will be the first to
+        be removed when the size of the buffer is reduced.
+        :param strategy: a :class:`DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate` strategy
+        :param data: an :class:`AvalancheDataset` dataset
+        :param num_workers: (optional) number of thread workers for the data loading. Default is 0.
+        :param pin_memory: (optional) If True, the data loader will copy Tensors into CUDA pinned memory before
+            returning them. Defaults to True.
+        :return: a sorted list of indices for the samples in `data`. The samples in `data` whose indices are the last
+            will be the first to be removed when the size of the buffer is reduced.
+        """
+        if len(strategy.model.subnetworks_classes) > 1:
+            raise RuntimeError("This selection strategy only works when there is a single subnetwork")
+        if len(data) == 0:
+            return []
+        # get the ID of the single subnetwork
+        single_subnet_id = list(strategy.model.subnetworks_classes.keys())[0]
+        # save the current state of the strategy
+        curr_state = strategy.save_train_state()
+        # set the model in the strategy to eval mode
+        strategy.model.eval()
+        # a new dataset with eval transformation loaded. This is done because eval transformations usually don't have
+        # any augmentation procedure. It does not affect the original dataset.
+        data = data.eval()
+
+        other_dataloader_args = strategy.obtain_common_dataloader_parameters(
+            batch_size=strategy.eval_mb_size,
+            num_workers=num_workers,
+            shuffle=False,
+            pin_memory=pin_memory,
+            persistent_workers=False,
+        )
+        collate_from_data_or_kwargs(data, other_dataloader_args)
+        dataloader = DataLoader(data, **other_dataloader_args)
+        grads: List[torch.Tensor] = []
+        for x, y, *_ in dataloader:
+            x = x.to(strategy.device)
+            y = y.to(strategy.device)
+            out = strategy.model(x, subnetwork_ids=single_subnet_id, use_init_feature_extractor=True)
+            logits = out[single_subnet_id]["incremental_classifier"][0]
+            features = out[single_subnet_id]["incremental_classifier"][1]
+            classes = torch.tensor(strategy.model.subnetworks_classes[single_subnet_id], device=y.device, dtype=y.dtype)
+            matches = y[:, None] == classes[None, :]
+            found, local_indices = matches.max(dim=1)
+            if (~found).any():
+                raise RuntimeError("At least one of the class targets does not belong to the single subnetwork")
+            grads.append(sample_wise_mce_grads_wrt_weights_biases(predicted_y=logits,
+                                                                  true_y=local_indices.to(y.dtype),
+                                                                  embeds=features))
+
+
+        # concatenate the gradients of all samples in `data` into a 2D tensor in the same order as they appear in `data`
+
+        grads = torch.cat(grads, dim=0)
+        # restore previous state
+        strategy.load_train_state(curr_state)
+
+        return self.make_sorted_indices_from_grads(grads)
+
+    @abstractmethod
+    def make_sorted_indices_from_grads(self, grads: torch.Tensor) -> List[int]:
+        """
+        Return a sorted list of indices for the gradients in `grads`. The samples whose respective gradients in
+        `grads` are the last in the sorted list of indices *must* be the first to be removed when the size of the
+        buffer is reduced.
+        :param grads: a 2D tensor of gradient vectors of the multi-class cross-entropy loss wrt the weights and bias in
+            the last layer
+        :return: a sorted list of indices for the gradients in `grads`. The samples whose respective gradients in
+            `grads` are the last in the sorted list of indices *must* be the first to be removed when the size of the
+            buffer is reduced.
+        """
+
+
 class HerdingExemplarsSelectionStrategyDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate(
     FeatureBasedExemplarsSelectionStrategyDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate):
     """
@@ -424,5 +637,53 @@ class HerdingExemplarsSelectionStrategyDynamicNetworkInitFeatureExtractorIncreme
             new_index = distances.argmin().tolist()
             selected_indices.append(new_index)
             current_center = candidate_centers[new_index]
+
+        return selected_indices
+
+
+class GSSExemplarsSelectionStrategyDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate(
+    MCELastLayerGradBasedExemplarsSelectionStrategyDynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate):
+    """
+    An offline greedy variant of the gradient-based selection strategy as described in
+    "Gradient based sample selection for online continual learning"
+    for :class:`DynamicNetworkInitFeatureExtractorIncrementalOutlierTemplate`.
+
+    It is a greedy algorithm that at each iteration selects the remaining exemplar whose gradient vector of the
+    multi-class cross-entropy loss wrt the weights and bias in the last layer is less similar in terms of
+    cosine similarity to the gradient vectors of the already selected exemplars.
+
+    .note::
+        This selection strategy *only* works when there is *only* one subnetwork
+    """
+
+    def make_sorted_indices_from_grads(self, grads: torch.Tensor) -> List[int]:
+        """
+        Return a sorted list of indices for the gradients in `grads` by using an offline greedy variant of the
+        gradient-based selection strategy as described in
+        "Gradient based sample selection for online continual learning".
+
+        It is a greedy algorithm that at each iteration selects the remaining exemplar whose gradient vector of the
+        multi-class cross-entropy loss wrt the weights and bias in the last layer is less similar in terms of
+        cosine similarity to the gradient vectors of the already selected exemplars.
+        The samples whose respective gradients in `grads` are the last in the sorted list of indices *must* be
+        the first to be removed when the size of the buffer is reduced.
+
+        :param grads: a 2D tensor of gradient vectors
+        :return: a sorted list of indices for the gradients in `grads`. The samples whose respective gradients in
+            `grads` are the last in the sorted list of indices *must* be the first to be removed when the size of the
+            buffer is reduced.
+        """
+        selected_indices: List[int] = []
+        grads = F.normalize(grads, p=2, dim=1)
+        cos_sim = grads @ grads.T
+        first_index = cos_sim.sum(dim=1).argmin().item()
+        cos_sim[first_index] = inf
+        selected_indices.append(first_index)
+
+        for _ in range(len(grads) - 1):
+            iteration_cos_sim = cos_sim[:, selected_indices]
+            index = iteration_cos_sim.sum(dim=1).argmin().item()
+            cos_sim[index] = inf
+            selected_indices.append(index)
 
         return selected_indices

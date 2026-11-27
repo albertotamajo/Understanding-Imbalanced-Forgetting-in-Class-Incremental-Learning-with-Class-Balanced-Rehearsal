@@ -730,10 +730,11 @@ class SupervisedProblemDynamicNetworkInitFeatureExtractorIncrementalOutlier(Supe
         .note::
             The output is a 1D tensor
         """
-        incremental_classifier_targets = copy.deepcopy(self.mb_y).cpu()
-        classes = self.model.subnetworks_classes[self.curr_sub_id]
-        incremental_classifier_targets.apply_(lambda x: classes.index(x) if x in classes else -1)
-        return incremental_classifier_targets.to(self.device)
+        mb_y = self.mb_y
+        classes = torch.tensor(self.model.subnetworks_classes[self.curr_sub_id], device=mb_y.device, dtype=mb_y.dtype)
+        matches = mb_y[:, None] == classes[None, :]
+        found, local_indices = matches.max(dim=1)
+        return local_indices.masked_fill(~found, -1).to(mb_y.dtype)
 
     @property
     def mb_y_masked_incremental_classifier(self) -> Tensor:
@@ -817,10 +818,8 @@ class SupervisedProblemDynamicNetworkInitFeatureExtractorIncrementalOutlier(Supe
         .note::
             The output is a 1D tensor
         """
-        outlier_detector_targets = copy.deepcopy(self.mb_y).to(self.device)
-        outlier_detector_targets[self.mb_task_id == int(self.curr_sub_id)] = 0
-        outlier_detector_targets[self.mb_task_id != int(self.curr_sub_id)] = 1
-        return outlier_detector_targets
+        mb_y = self.mb_y
+        return (self.mb_task_id != int(self.curr_sub_id)).to(device=mb_y.device, dtype=mb_y.dtype)
 
     def criterion(self, use_incremental_classifier_prob_vecs: bool = False, **kwargs):
         """
