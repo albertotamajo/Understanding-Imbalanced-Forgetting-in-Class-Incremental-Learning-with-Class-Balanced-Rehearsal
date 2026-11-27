@@ -36,7 +36,7 @@ To fully reproduce the results presented in the paper, follow the instructions b
 	- These scripts produce `.pkl` files containing the extracted data. Move these files into the respective subfolders within the `Analysis` folder.
 4. Use the analysis scripts located in the subfolders of the `Analysis` folder to analyze the extracted data.
 ### Lightweight Reproducibility
-Alternatively, since full reproduction is time-consuming, you can skip Steps 1–3 by downloading the ZIP archives containing the .pkl files generated during our empirical investigation from our Zenodo repository. Extract the archives, move the files to their respective subfolders within the Analysis folder, and proceed directly to Step 4.
+Alternatively, since full reproduction is time-consuming, you can skip Steps 1–3 by downloading the ZIP archives containing the `.pkl` files generated during our empirical investigation from our Zenodo repository. Extract the archives, move the files to their respective subfolders within the `Analysis` folder, and proceed directly to Step 4.
 
 ## Citation
 If you find our work useful in your research, please consider citing:
