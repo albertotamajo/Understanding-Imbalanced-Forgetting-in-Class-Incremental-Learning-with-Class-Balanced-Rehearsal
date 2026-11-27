@@ -16,6 +16,7 @@ Neural networks suffer from *catastrophic forgetting* in class-incremental learn
 ├── Extractions/       # Scripts for extracting data from completed experiments
 ├── benchmarks/        # CIFAR-100, TinyImageNet, and ImageNet benchmarks adapted to class-incremental learning
 ├── convnets/          # ResNet backbone implementations
+├── llifc/             # Code related to the Last-Layer Interference Coefficients
 ├── metrics/           # Metrics tracked during continual learning
 ├── models/            # Building blocks for continual learning architectures
 ├── training/          # Continual learning training loops
